@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kam-cryoem"
+version = "0.2.0"
+description = "Method-of-moments ab initio modeling for cryo-EM, with RELION refinement preparation"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy",
+    "scipy",
+    "matplotlib",
+    "mrcfile",
+    "finufft",
+    "scikit-image",
+    "tqdm",
+    "aspire",
+    "torch",
+]
+
+[project.optional-dependencies]
+gpu = ["cupy-cuda12x"]
+
+[project.scripts]
+kam = "kam.command_line:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+packages = ["kam"]
+
+[tool.setuptools.package-data]
+kam = ["sphere_rules/*"]
