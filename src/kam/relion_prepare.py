@@ -542,7 +542,7 @@ def prepare_refinement_main(argv=None):
             "initializer": {
                 "support_mask_applied": False,
                 "lowpass_applied": False,
-                "note": "RELION --ini_high low-passes the reference at start-up",
+                "note": "RELION --ini_high, when given, low-passes the reference at start-up; none by default",
                 "particle_diameter_angstrom": args.particle_diameter,
             },
             "particles": {
@@ -821,8 +821,12 @@ def _write_refinement_script(preparation, dataset, parameters):
         "command -v relion_refine_mpi | tee relion_executable.txt",
         "nvidia-smi --query-gpu=name,memory.total --format=csv",
         "",
-        f"# The initializer is the unmasked, unfiltered MoM map; ini_high {ini_high:g} A low-passes it.",
-        "# ini_high also controls RELION's initial working resolution and CC iteration.",
+        ("# The initializer is the unmasked, unfiltered MoM map; RELION applies no initial low-pass."
+         if ini_high is None else
+         f"# The initializer is the unmasked, unfiltered MoM map; ini_high {ini_high:g} A low-passes it."),
+        ("# Without --ini_high RELION starts from the resolution of the reference itself."
+         if ini_high is None else
+         "# ini_high also controls RELION's initial working resolution and CC iteration."),
         "command=(",
         '    srun --export=ALL --mpi=pmix_v3 --kill-on-bad-exit=1 -n 3 -c "$OMP_NUM_THREADS"',
         (f"    --gres={gres} --cpu-bind=cores --gpu-bind=none"
@@ -830,7 +834,8 @@ def _write_refinement_script(preparation, dataset, parameters):
         f"    bash -c {shlex.quote(rank_launcher)} relion_rank",
         '    --i "$JOB/inputs/particles.star" --ref "$JOB/inputs/initial_model.mrc"',
         '    --o "$JOB/run" --auto_refine --split_random_halves',
-        f"    --firstiter_cc --trust_ref_size --ini_high {ini_high:.17g}",
+        ("    --firstiter_cc --trust_ref_size" if ini_high is None
+         else f"    --firstiter_cc --trust_ref_size --ini_high {ini_high:.17g}"),
         f"    --ctf --sym {_shell_literal(symmetry)} --particle_diameter {diameter:.17g}",
         "    --flatten_solvent --zero_mask --norm --scale",
         "    --oversampling 1 --healpix_order 2 --auto_local_healpix_order 4",
@@ -878,8 +883,8 @@ def relion_prepare_main(argv=None):
     parser.add_argument("--expected-particles", type=_positive_int)
     parser.add_argument("--particle-diameter", required=True, type=_positive_float)
     parser.add_argument("--symmetry", default="C1")
-    parser.add_argument("--ini-high", type=_positive_float, default=30.0,
-                        help="initializer low-pass and RELION startup resolution in A")
+    parser.add_argument("--ini-high", type=_positive_float, default=None,
+                        help="optional RELION --ini_high initial low-pass in A (default: none, no low-pass)")
     parser.add_argument("--offset-range", type=_positive_float, default=40.0)
     parser.add_argument("--offset-step", type=_positive_float, default=4.0)
     parser.add_argument("--low-resol-join-halves", type=_positive_float, default=40.0)
@@ -943,7 +948,7 @@ def relion_prepare_main(argv=None):
         native_pixel, args.expected_particles)
     if args.particle_diameter >= native_side * native_pixel:
         raise ValueError("particle diameter does not fit inside the box")
-    if args.ini_high < 2.0 * native_pixel:
+    if args.ini_high is not None and args.ini_high < 2.0 * native_pixel:
         raise ValueError("--ini-high must be at least the native Nyquist resolution")
     parameters = {
         "particle_diameter_angstrom": args.particle_diameter,
