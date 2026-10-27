@@ -13,7 +13,7 @@
 #SBATCH --mail-user=yw3384@princeton.edu
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --export=NONE
-#SBATCH --chdir=/home/yw3384/softwares/Kam-cryoEM-FB
+#SBATCH --chdir=/home/yw3384/softwares/denoised_kam
 #SBATCH --output=/dev/null
 #SBATCH --error=/dev/null
 

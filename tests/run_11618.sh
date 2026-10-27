@@ -13,9 +13,9 @@
 #SBATCH --mail-user=yw3384@princeton.edu
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --export=NONE
-#SBATCH --chdir=/home/yw3384/softwares/Kam-cryoEM-FB
-#SBATCH --output=/home/yw3384/softwares/Kam-cryoEM-FB/local/logs/kam11618_%j.out
-#SBATCH --error=/home/yw3384/softwares/Kam-cryoEM-FB/local/logs/kam11618_%j.err
+#SBATCH --chdir=/home/yw3384/softwares/denoised_kam
+#SBATCH --output=/home/yw3384/softwares/denoised_kam/local/logs/kam11618_%j.out
+#SBATCH --error=/home/yw3384/softwares/denoised_kam/local/logs/kam11618_%j.err
 
 set -euo pipefail
 
