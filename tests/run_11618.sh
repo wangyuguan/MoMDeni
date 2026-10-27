@@ -63,6 +63,10 @@ kam relion_prepare \
   --low-resol-join-halves 40
 
 # RELION refinement.
+# This version of relion_prepare always writes --ini_high (default 30 A); the reported refinements use none.
+sed -i 's/ --ini_high [0-9.]*//' "$RUN_ROOT/relion_prepare/run_refinement.sh"
+! grep -q -- "--ini_high" "$RUN_ROOT/relion_prepare/run_refinement.sh"
+
 bash "$RUN_ROOT/relion_prepare/run_refinement.sh"
 
 # Masked, sharpened resolution (comparable with published numbers).
