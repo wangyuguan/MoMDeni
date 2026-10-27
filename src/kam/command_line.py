@@ -290,6 +290,7 @@ def _configuration(args: argparse.Namespace) -> dict:
                 "algorithm_configuration": _centering_algorithm_configuration(args),
                 "radius_denoise_pixels": args.centering_radius,
                 "max_shift_denoise_pixels": args.centering_max_shift,
+                "individual_residuals": (args.centering_individual if args.centering else None),
                 "ctf_mode": args.centering_ctf_mode if args.centering else None,
                 "wiener_balance": (
                     args.centering_wiener_balance
@@ -361,6 +362,8 @@ def _denoise_command(args, paths):
     if args.centering:
         command.extend(["--centering-radius", str(args.centering_radius)])
         command.extend(["--centering-max-shift", str(args.centering_max_shift)])
+        command.append("--centering-individual" if args.centering_individual
+                       else "--no-centering-individual")
         command.extend(["--centering-ctf-mode", args.centering_ctf_mode])
         command.extend(["--centering-wiener-balance",
                         str(args.centering_wiener_balance)])
@@ -710,6 +713,7 @@ def _validate_denoising_centering(report, saved, args) -> None:
             raise ValueError(
                 f"completed denoising has missing or incompatible provenance: {key}")
     expected_max_shift = args.centering_max_shift if args.centering else None
+    expected_individual = args.centering_individual if args.centering else None
     expected_ctf_mode = args.centering_ctf_mode if args.centering else None
     expected_balance = (args.centering_wiener_balance
                         if args.centering and expected_ctf_mode == "wiener" else None)
@@ -717,6 +721,7 @@ def _validate_denoising_centering(report, saved, args) -> None:
             or report.get("centering_method") != expected_method
             or report.get("centering_radius_denoise_pixels") != expected_radius
             or report.get("centering_max_shift_denoise_pixels") != expected_max_shift
+            or report.get("centering_individual", True if args.centering else None) != expected_individual
             or report.get("centering_ctf_mode") != expected_ctf_mode
             or report.get("centering_wiener_balance") != expected_balance):
         raise ValueError("completed denoising used different image centering settings")
@@ -1273,6 +1278,11 @@ def _add_centering_arguments(parser):
               "pixels (default: max(2, centering-radius // 4)); this does not "
               "bound the separate guarded common-shift search"))
     parser.add_argument(
+        "--centering-individual", action=argparse.BooleanOptionalAction, default=True,
+        help=("after the guarded common shift, also estimate shrunk individual "
+              "residual shifts (default); --no-centering-individual applies the "
+              "common shift only"))
+    parser.add_argument(
         "--centering-ctf-mode", choices=("flip", "wiener"), default=None,
         help=("individual residual-estimator CTF handling: 'flip' corrects "
               "only the transfer sign; 'wiener' (default) also restores the CTF-suppressed "
@@ -1701,6 +1711,7 @@ def _denoise_parse_args(argv=None):
             flip_sign=args.flip_sign,
             centering_radius=args.centering_radius,
             centering_max_shift=args.centering_max_shift,
+            centering_individual=args.centering_individual,
             centering_ctf_mode=args.centering_ctf_mode,
             centering_wiener_balance=args.centering_wiener_balance,
             centering_output_dir=args.centering_output_dir,
@@ -1733,6 +1744,7 @@ def denoise_main(argv=None):
             flip_sign=args.flip_sign,
             centering_radius=args.centering_radius,
             centering_max_shift=args.centering_max_shift,
+            centering_individual=args.centering_individual,
             centering_ctf_mode=args.centering_ctf_mode,
             centering_wiener_balance=args.centering_wiener_balance,
             centering_output_dir=args.centering_output_dir,
@@ -2357,6 +2369,11 @@ def _latest_completed_relion_job(relion_dir: Path) -> tuple[Path, Path, Path]:
         provenance_path = job / "inputs/provenance.json"
         try:
             provenance = _read_json(provenance_path)
+            if provenance.get("control"):
+                # Control runs: the "source" is a foreign deposited map that was
+                # resampled/cropped into the particle box; evaluate the actual
+                # initializer handed to RELION, not the deposited map.
+                raise ValueError("control initializer: use inputs/initial_model.mrc")
             source = provenance.get("source", {})
             source_map = Path(source.get("map", "")).expanduser()
             if source_map and not source_map.is_absolute():

@@ -3,4 +3,4 @@
 	url = https://github.com/nmarshallf/fle_2d.git
 [submodule "fast-cryoEM-PCA"]
 	path = fast-cryoEM-PCA
-	url = https://github.com/wangyuguan/fast-cryoEM-PCA.git
+	url = https://github.com/yunpeng-shi/fast-cryoEM-PCA.git

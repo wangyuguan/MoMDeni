@@ -217,6 +217,148 @@ class LowDegreeViewingDensity:
         )
 
 
+class LinearViewingDensity:
+    """Linear low-degree spherical-harmonic viewing density relative to Haar.
+
+    Unused alternative to :class:`LowDegreeViewingDensity` (the sum-of-squares
+    density the pipeline uses); same interface, no positivity constraint.
+
+    The density of viewing directions is expanded in real spherical harmonics
+    up to ``degree``,
+
+        rho(v) = 1 + sum_k beta_k phi_k(v),
+
+    which is the Wigner-D expansion of the paper restricted to in-plane
+    uniform rotations (the ``v = 0`` entries) with ``B_{0,0,0} = 1``.  The
+    features ``phi_k`` are the real spherical harmonics scaled to be
+    orthonormal for the normalized surface measure, so ``rho`` integrates to
+    one for every ``beta`` and the constant term stays fixed.  Degree 0, 2,
+    and 4 have 0, 8, and 24 free parameters.  Positivity is not enforced.
+
+    ``antipodal`` keeps the even degrees only, so ``rho(-v) = rho(v)``.  This
+    is the exact symmetry of reflection-augmented moments: a mirrored image
+    is the projection along ``-v``, so the odd degrees are unidentifiable
+    flat directions of that objective.  Degree 0, 2, and 4 then have 0, 5,
+    and 14 free parameters.
+    """
+
+    def __init__(self, grid, degree=2, antipodal=False):
+        if (isinstance(degree, (bool, np.bool_)) or int(degree) != degree
+                or degree < 0 or degree % 2):
+            raise ValueError("degree must be an even nonnegative integer")
+        if not isinstance(antipodal, (bool, np.bool_)):
+            raise ValueError("antipodal must be Boolean")
+        self.grid = grid
+        self.degree = int(degree)
+        self.antipodal = bool(antipodal)
+        self.degrees = [ell for ell in range(1, self.degree + 1)
+                        if not self.antipodal or ell % 2 == 0]
+        q = np.asarray(grid.q, dtype=np.float64)
+        self.H = self._features(grid.xyz)
+        self.n_parameters = self.H.shape[1]
+        self.n_view_parameters = self.n_parameters
+        self.n_features = self.n_parameters + 1
+        if (q.shape != (grid.Ns,) or len(self.H) != grid.Ns
+                or not np.all(np.isfinite(q)) or np.any(q <= 0)
+                or not np.isclose(q.sum(), 1.0, rtol=0, atol=1e-12)):
+            raise ValueError(
+                "grid.q must be finite positive normalized sphere masses")
+        self.q = q.copy()
+        full = np.column_stack((np.ones(grid.Ns), self.H))
+        self.gram = full.T @ (self.q[:, None] * full)
+        self.gram_error = float(
+            np.max(np.abs(self.gram - np.eye(self.n_features))))
+        if self.gram_error > 1e-10:
+            raise ValueError(
+                "sphere quadrature must integrate the viewing harmonics exactly")
+        self._moment_features = np.column_stack((
+            np.ones(grid.Ns),
+            np.sqrt(4 * np.pi)
+            * real_spherical_harmonics(grid.xyz, self.degree),
+        ))
+
+    def _features(self, directions):
+        """Retained real harmonics, orthonormal for the normalized measure."""
+
+        harmonics = np.sqrt(4 * np.pi) * real_spherical_harmonics(
+            directions, self.degree)
+        if not self.degrees:
+            return np.empty((len(harmonics), 0))
+        keep = np.concatenate([
+            np.arange(ell * ell - 1, (ell + 1) ** 2 - 1)
+            for ell in self.degrees])
+        return harmonics[:, keep]
+
+    def _beta(self, beta):
+        beta = np.asarray(beta, dtype=np.float64)
+        if (beta.shape != (self.n_parameters,)
+                or not np.all(np.isfinite(beta))):
+            raise ValueError(
+                "beta must be a finite vector of harmonic coefficients")
+        return beta
+
+    def density(self, beta, directions=None):
+        """Evaluate the density relative to uniform sphere measure.
+
+        ``directions`` contains unit vectors; omitting it evaluates the
+        quadrature nodes. Divide by ``4*pi`` for density per steradian.
+        """
+
+        beta = self._beta(beta)
+        features = self.H if directions is None else self._features(directions)
+        return 1.0 + features @ beta
+
+    def pmf(self, beta):
+        """Return signed masses including the sphere quadrature weights."""
+
+        return self.q * self.density(beta)
+
+    def vjp(self, beta, grad_p):
+        """Apply the transpose derivative of :meth:`pmf`."""
+
+        grad_p = np.asarray(grad_p, dtype=np.float64)
+        if grad_p.shape != self.q.shape or not np.all(np.isfinite(grad_p)):
+            raise ValueError(
+                "grad_p must be finite with one value per sphere node")
+        self._beta(beta)
+        return self.H.T @ (self.q * grad_p)
+
+    def evaluate(self, beta):
+        """Return normalization, sign, and SH diagnostics."""
+
+        beta = self._beta(beta)
+        relative_density = self.density(beta)
+        p = self.q * relative_density
+        moments = p @ self._moment_features
+        moment_power = [
+            float(np.sum(moments[ell * ell:(ell + 1) ** 2] ** 2))
+            for ell in range(self.degree + 1)
+        ]
+        return dict(
+            viewing_representation=(
+                "real spherical-harmonic (Wigner-D) linear expansion"),
+            viewing_degree=self.degree,
+            n_view_parameters=self.n_parameters,
+            viewing_n_features=self.n_features,
+            viewing_coefficient_norm=float(np.linalg.norm(beta)),
+            viewing_density_min=float(relative_density.min()),
+            viewing_density_max=float(relative_density.max()),
+            viewing_negative_mass=float(-np.sum(p[p < 0])),
+            viewing_haar_normalization=1.0,
+            viewing_quadrature_gram_error=self.gram_error,
+            viewing_mass_sum=float(p.sum()),
+            viewing_min_mass=float(p.min()),
+            viewing_max_mass=float(p.max()),
+            viewing_ess=float(1.0 / np.sum(p * p)),
+            viewing_sh_moments=moments.tolist(),
+            viewing_sh_power_by_degree=moment_power,
+            viewing_antipodal_symmetry=self.antipodal,
+            viewing_moment_note=(
+                "quadrature SH moments; exact coefficients require degree-2L "
+                "quadrature"),
+        )
+
+
 def _single_order_weights(targets, lambdas):
     if len(targets) != 3 or len(lambdas) != 3:
         raise ValueError("targets and lambdas must each contain M1, M2, M3")

@@ -13,7 +13,7 @@
 #SBATCH --mail-user=yw3384@princeton.edu
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --export=NONE
-#SBATCH --chdir=/home/yw3384/softwares/denoised_kam
+#SBATCH --chdir=/home/yw3384/softwares/Kam-cryoEM-FB
 #SBATCH --output=/dev/null
 #SBATCH --error=/dev/null
 
@@ -55,7 +55,7 @@ for arg in "$@"; do
   case "$arg" in --dry-run|--help|-h) exit 0 ;; esac
 done
 
-# Native-grid RELION inputs (unmasked, unfiltered initializer; no RELION initial low-pass).
+# Native-grid RELION inputs and initial low-pass.
 kam relion_prepare \
   --pipeline-dir "$RUN_ROOT/kam_pipeline" \
   --particles /tigress/CRYOEM/singerlab/mg6942/RECOVAR_RELION_EM_COMPARISON/full_dataset_native_resolution/per_dataset/10073/inputs/particles.native.star \
@@ -63,6 +63,7 @@ kam relion_prepare \
   --native-pixel-size 1.43 \
   --particle-diameter 250 \
   --symmetry C1 \
+  --ini-high 60 \
   --offset-range 40 \
   --offset-step 8 \
   --low-resol-join-halves 40

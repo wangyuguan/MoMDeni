@@ -91,6 +91,7 @@ class FastCWFDenoiseConfig:
     recenter_from_star: bool = False
     centering_radius: int | None = None
     centering_max_shift: int | None = None
+    centering_individual: bool = True
     centering_ctf_mode: str = "wiener"
     centering_wiener_balance: float = 0.05
     centering_output_dir: Path | None = None
@@ -134,6 +135,8 @@ class FastCWFDenoiseConfig:
             raise ValueError("flip_sign must be Boolean")
         if not isinstance(self.recenter_from_star, (bool, np.bool_)):
             raise ValueError("recenter_from_star must be Boolean")
+        if not isinstance(self.centering_individual, (bool, np.bool_)):
+            raise ValueError("centering_individual must be Boolean")
         if self.centering_radius is not None:
             if (isinstance(self.centering_radius, (bool, np.bool_))
                     or not isinstance(self.centering_radius, (int, np.integer))
@@ -904,6 +907,7 @@ def denoise_relion_particles(config: FastCWFDenoiseConfig) -> FastCWFDenoiseResu
             "max_shift_denoise_pixels": (
                 None if args.centering_max_shift is None
                 else int(args.centering_max_shift)),
+            "individual_residuals": bool(args.centering_individual),
             "ctf_mode": args.centering_ctf_mode,
             "wiener_balance": (args.centering_wiener_balance
                                if args.centering_ctf_mode == "wiener" else None),
@@ -971,7 +975,7 @@ def denoise_relion_particles(config: FastCWFDenoiseConfig) -> FastCWFDenoiseResu
         residual_limit = (max(2, args.centering_radius // 4)
                           if args.centering_max_shift is None else args.centering_max_shift)
         centering_config = CenteringConfig(
-            individual_centering=True, support_radius_fraction=args.centering_radius / args.denoise_res,
+            individual_centering=bool(args.centering_individual), support_radius_fraction=args.centering_radius / args.denoise_res,
             residual_max_shift_fraction=residual_limit / args.denoise_res,
             wiener_balance=args.centering_wiener_balance, ctf_mode=args.centering_ctf_mode,
             contrast_sign=-1 if args.flip_sign else 1,
@@ -1299,6 +1303,7 @@ def denoise_relion_particles(config: FastCWFDenoiseConfig) -> FastCWFDenoiseResu
             -1 if args.centering_radius is None else args.centering_radius),
         centering_max_shift_denoise_pixels=(
             -1 if args.centering_max_shift is None else args.centering_max_shift),
+        centering_individual=bool(args.centering_individual),
         centering_ctf_mode=(args.centering_ctf_mode if image_centering else "none"),
         centering_wiener_balance=(
             args.centering_wiener_balance
@@ -1412,6 +1417,7 @@ def denoise_relion_particles(config: FastCWFDenoiseConfig) -> FastCWFDenoiseResu
         "centering_method_version": CENTERING_METHOD_VERSION if image_centering else 0,
         "centering_radius_denoise_pixels": args.centering_radius,
         "centering_max_shift_denoise_pixels": args.centering_max_shift,
+        "centering_individual": (bool(args.centering_individual) if args.centering_radius is not None else None),
         "centering_ctf_mode": (args.centering_ctf_mode if image_centering else None),
         "centering_wiener_balance": (
             args.centering_wiener_balance
