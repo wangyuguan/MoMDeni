@@ -2984,13 +2984,9 @@ def plot_aligned_viewing_distributions(
     """Compare fitted MoM density and final RELION poses in the reference frame.
 
     The MoM density uses the initial map's alignment; RELION poses use the
-    refined map's alignment. RELION is plotted as one point per particle
-    without smoothing or symmetry expansion. When the MoM fit was formed
-    with reflection augmentation (an antipodal density), each particle's
-    mirror image is also plotted: mirroring a projection is the same as
-    viewing the molecule from the antipodal direction, so the mirrored
-    image's direction is -n. Equal-area pose histograms are retained only
-    as numerical diagnostics.
+    refined map's alignment. RELION is plotted as one point per particle,
+    without smoothing, antipodal folding, or symmetry expansion. Equal-area
+    pose histograms are retained only as numerical diagnostics.
     """
 
     from aspire.utils import RelionStarFile
@@ -3042,21 +3038,16 @@ def plot_aligned_viewing_distributions(
     ))
     relion_directions = original_directions @ transforms[1].T
     relion_directions /= np.linalg.norm(relion_directions, axis=1)[:, None]
-    # The mirror image of a projection along n is the projection along -n
-    # (up to an in-plane rotation), so reflection augmentation adds -n.
-    mirrored_directions = (-relion_directions if antipodal
-                           else np.empty((0, 3), dtype=np.float64))
-    plotted_directions = np.vstack((relion_directions, mirrored_directions))
 
     longitude_edges = np.linspace(-np.pi, np.pi, 73)
     z_edges = np.linspace(-1.0, 1.0, 37)
     counts, _, _ = np.histogram2d(
-        np.clip(plotted_directions[:, 2], -1.0, 1.0),
-        np.arctan2(plotted_directions[:, 1], plotted_directions[:, 0]),
+        np.clip(relion_directions[:, 2], -1.0, 1.0),
+        np.arctan2(relion_directions[:, 1], relion_directions[:, 0]),
         bins=(z_edges, longitude_edges),
     )
     cell_area = np.diff(z_edges)[:, None] * np.diff(longitude_edges)[None, :]
-    relion_density = counts / (len(plotted_directions) * cell_area)
+    relion_density = counts / (rot.size * cell_area)
 
     # Evaluate the fitted continuous SH function, not an interpolated node PMF.
     smooth_longitude_edges = np.linspace(-np.pi, np.pi, 361)
@@ -3075,7 +3066,7 @@ def plot_aligned_viewing_distributions(
     ).reshape(z.shape) / (4 * np.pi)
     mom_integral = float(q @ density.density(beta, xyz @ transforms[0]))
     relion_integral = float(np.sum(relion_density * cell_area))
-    if (int(counts.sum()) != len(plotted_directions)
+    if (int(counts.sum()) != rot.size
             or not np.isclose(mom_integral, 1.0, atol=1e-10, rtol=0)
             or not np.isclose(relion_integral, 1.0, atol=1e-12, rtol=0)):
         raise ValueError("aligned viewing distributions lost probability mass")
@@ -3085,8 +3076,7 @@ def plot_aligned_viewing_distributions(
     relion_pdf = output / "viewing_density_relion_aligned.pdf"
     data_path = output / "viewing_density_aligned.npz"
     maximum = float(mom_density.max())
-    relion_title = "RELION, images and mirrors" if antipodal else "RELION"
-    for pdf, title in ((mom_pdf, "MoM"), (relion_pdf, relion_title)):
+    for pdf, title in ((mom_pdf, "MoM"), (relion_pdf, "RELION")):
         figure, axis = plt.subplots(
             subplot_kw={"projection": "mollweide"}, figsize=(6.5, 3.8),
             layout="constrained",
@@ -3104,19 +3094,8 @@ def plot_aligned_viewing_distributions(
                 np.arctan2(relion_directions[:, 1], relion_directions[:, 0]),
                 np.arcsin(np.clip(relion_directions[:, 2], -1.0, 1.0)),
                 s=1.5, c="black", marker=".", alpha=1.0, linewidths=0,
-                rasterized=True, label="image",
+                rasterized=True,
             )
-            if antipodal:
-                axis.scatter(
-                    np.arctan2(mirrored_directions[:, 1],
-                               mirrored_directions[:, 0]),
-                    np.arcsin(np.clip(mirrored_directions[:, 2], -1.0, 1.0)),
-                    s=1.5, c="tab:red", marker=".", alpha=1.0, linewidths=0,
-                    rasterized=True, label="mirror image",
-                )
-                axis.legend(loc="lower center", bbox_to_anchor=(0.5, -0.12),
-                            ncol=2, frameon=False, markerscale=8,
-                            handletextpad=0.2)
         axis.set_title(title)
         axis.set_longitude_grid(60)
         axis.set_latitude_grid(30)
@@ -3131,7 +3110,6 @@ def plot_aligned_viewing_distributions(
         relion_counts=counts.astype(np.int64),
         relion_density_per_steradian=relion_density,
         relion_directions_aligned=relion_directions,
-        relion_directions_mirrored=mirrored_directions,
         mom_direction_transform=transforms[0],
         relion_direction_transform=transforms[1],
     )
@@ -3146,21 +3124,13 @@ def plot_aligned_viewing_distributions(
         direction_convention="oriented camera normal; RELION A[2,:], MoM R[:,2]",
         transform_convention=("T=alignment.rotation @ diag(-1,1,1) if reflected, "
                               "otherwise T=alignment.rotation; "
-                              "n_aligned=det(T)*T@n; no antipodal folding; "
-                              "mirror images plotted at -n_aligned when the "
-                              "MoM density is antipodal"),
+                              "n_aligned=det(T)*T@n; no antipodal folding"),
         mom_direction_transform=transforms[0].tolist(),
         relion_direction_transform=transforms[1].tolist(),
         mom_viewing_degree=int(degree), relion_particle_count=int(rot.size),
         mom_plot_kind="continuous spherical-harmonic density",
-        mom_antipodal=bool(antipodal),
-        relion_plot_kind=("scatter of every aligned per-particle direction"
-                          + (" plus the antipodal direction of its mirror image"
-                             if antipodal else "")),
-        relion_mirror_images_included=bool(antipodal),
+        relion_plot_kind="scatter of every aligned per-particle direction",
         relion_scatter=dict(count=int(rot.size), color="black", marker=".",
-                            mirrored_count=int(len(mirrored_directions)),
-                            mirrored_color="tab:red",
                             size_points_squared=1.5, alpha=1.0,
                             rasterized_in_pdf=True, dpi=300, colorbar=False),
         relion_histogram_shape=list(counts.shape),

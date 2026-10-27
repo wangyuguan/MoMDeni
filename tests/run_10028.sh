@@ -53,11 +53,12 @@ for arg in "$@"; do
   case "$arg" in --dry-run|--help|-h) exit 0 ;; esac
 done
 
-# Native-grid RELION inputs (unmasked, unfiltered initializer; no RELION initial low-pass).
+# Native-grid RELION inputs and initial low-pass.
 kam relion_prepare \
   --pipeline-dir "$RUN_ROOT/kam_pipeline" \
   --particle-diameter 300 \
   --symmetry C1 \
+  --ini-high 60 \
   --offset-range 10 \
   --offset-step 2 \
   --low-resol-join-halves 40

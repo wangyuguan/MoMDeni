@@ -81,7 +81,7 @@ with mrcfile.new(target, overwrite=True) as handle:
 print(f"wrote {target}: {volumes[0].shape[0]} pixels at {voxel:.4f} A")
 PYTHON
 
-# Native-grid RELION inputs (unmasked, unfiltered initializer; no RELION initial low-pass). The particle diameter follows
+# Native-grid RELION inputs and initial low-pass. The particle diameter follows
 # the consensus refinement that produced those half-maps, and the offset search
 # is wider than for the other datasets because the origins here have RMS 40 and
 # 99th percentile 86 native pixels.
@@ -89,6 +89,7 @@ kam relion_prepare \
   --pipeline-dir "$RUN_ROOT/kam_pipeline" \
   --particle-diameter 473 \
   --symmetry C1 \
+  --ini-high 60 \
   --offset-range 50 \
   --offset-step 10 \
   --low-resol-join-halves 40
