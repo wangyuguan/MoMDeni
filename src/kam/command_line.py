@@ -253,6 +253,7 @@ def _centering_algorithm_configuration(args: argparse.Namespace) -> dict | None:
     from dataclasses import asdict
 
     return asdict(CenteringConfig(
+        individual_centering=bool(args.centering_individual),
         support_radius_fraction=args.centering_radius / args.denoise_res,
         residual_max_shift_fraction=args.centering_max_shift / args.denoise_res,
         ctf_mode=args.centering_ctf_mode,
