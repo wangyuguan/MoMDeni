@@ -242,7 +242,7 @@ def _joint_fit(law, orig_fit, param, grid, targets, lambdas, weight, arguments, 
 
     result = minimize(objective, x0, jac=True, method="L-BFGS-B", callback=callback,
                       bounds=[(None, None)] * (nt + nb) + [(0.0, None)] * M,
-                      options=dict(maxiter=maxiter, maxfun=max(15000, 20 * maxiter), ftol=1e-12, gtol=1e-10, maxcor=100))
+                      options=dict(maxiter=maxiter, maxfun=max(15000, 20 * maxiter), ftol=1e-10, gtol=1e-10, maxcor=100))
     x = np.asarray(result.x, float).copy()
     theta, beta, u = x[:nt], x[nt:nt + nb], x[nt + nb:]
     d, p = u / u.sum(), density.pmf(x[nt:nt + nb])

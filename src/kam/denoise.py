@@ -9,7 +9,7 @@ manifest retains the original per-particle CTF metadata and describes both the
 astigmatism and defocus-quantization approximations.
 
 By default no RELION pose, origin, reference map, or clean projection is used.
-Optional image-based centering estimates translations without STAR origins.
+Optional global centering estimates one shift common to the dataset without STAR origins.
 A separate diagnostic opt-in can use STAR origins instead. Both occur before
 background or covariance estimation and never apply orientation angles.
 Downstream moment estimation must treat the saved images as clean latent images:
@@ -89,13 +89,8 @@ class FastCWFDenoiseConfig:
     fle_root: Path = DEFAULT_FLE_ROOT
     driver_path: Path | None = None
     recenter_from_star: bool = False
-    centering_radius: int | None = None
-    centering_max_shift: int | None = None
-    centering_individual: bool = True
-    centering_ctf_mode: str = "wiener"
-    centering_wiener_balance: float = 0.05
+    centering: bool = False
     centering_output_dir: Path | None = None
-    centering_max_distance_fraction: float | None = None
 
     def __post_init__(self):
         for name in ("star_path", "output_dir", "fast_pca_root", "fle_root"):
@@ -106,8 +101,8 @@ class FastCWFDenoiseConfig:
             object.__setattr__(self, "driver_path", Path(self.driver_path))
         if self.centering_output_dir is not None:
             object.__setattr__(self, "centering_output_dir", Path(self.centering_output_dir))
-            if self.centering_radius is None:
-                raise ValueError("centering_output_dir requires image-based centering")
+            if not self.centering:
+                raise ValueError("centering_output_dir requires global centering")
         if not isinstance(self.dataset_label, str) or not self.dataset_label.strip():
             raise ValueError("dataset_label must be nonempty")
         if self.n_images < 0 or min(self.batch_size, self.workers) < 1:
@@ -135,43 +130,10 @@ class FastCWFDenoiseConfig:
             raise ValueError("flip_sign must be Boolean")
         if not isinstance(self.recenter_from_star, (bool, np.bool_)):
             raise ValueError("recenter_from_star must be Boolean")
-        if not isinstance(self.centering_individual, (bool, np.bool_)):
-            raise ValueError("centering_individual must be Boolean")
-        if self.centering_radius is not None:
-            if (isinstance(self.centering_radius, (bool, np.bool_))
-                    or not isinstance(self.centering_radius, (int, np.integer))
-                    or not 1 <= self.centering_radius <= (self.denoise_res - 1) // 2):
-                raise ValueError("centering_radius must be an integer whose support disk fits the denoising grid")
-            if self.recenter_from_star:
-                raise ValueError("image-based centering and RELION-origin recentering are mutually exclusive")
-            object.__setattr__(self, "centering_radius", int(self.centering_radius))
-        if self.centering_max_shift is not None:
-            if self.centering_radius is None:
-                raise ValueError("centering_max_shift requires image-based centering")
-            largest = self.denoise_res // 2 - self.centering_radius
-            if (isinstance(self.centering_max_shift, (bool, np.bool_))
-                    or not isinstance(self.centering_max_shift, (int, np.integer))
-                    or not 1 <= self.centering_max_shift <= largest):
-                raise ValueError("centering_max_shift must be an integer in "
-                                 f"[1, {largest}] so candidate disks fit the grid")
-            object.__setattr__(self, "centering_max_shift", int(self.centering_max_shift))
-        if self.centering_ctf_mode not in ("flip", "wiener"):
-            raise ValueError("centering_ctf_mode must be 'flip' or 'wiener'")
-        if (isinstance(self.centering_wiener_balance, (bool, np.bool_))
-                or not np.isfinite(self.centering_wiener_balance)
-                or self.centering_wiener_balance <= 0):
-            raise ValueError("centering_wiener_balance must be finite and positive")
-        object.__setattr__(self, "centering_wiener_balance",
-                           float(self.centering_wiener_balance))
-        if self.centering_max_distance_fraction is not None:
-            if self.centering_radius is None:
-                raise ValueError("centering_max_distance_fraction requires image-based centering")
-            from .centering import centering_distance_mask
-
-            centering_distance_mask(
-                np.empty((0, 2)), np.empty(0, dtype=bool),
-                (self.denoise_res, self.denoise_res),
-                self.centering_max_distance_fraction)
+        if not isinstance(self.centering, (bool, np.bool_)):
+            raise ValueError("centering must be Boolean")
+        if self.centering and self.recenter_from_star:
+            raise ValueError("global centering and RELION-origin recentering are mutually exclusive")
 
 
 @dataclass(frozen=True)
@@ -573,100 +535,6 @@ def save_centering_preview(before, after, path, *, estimated_centers_yx):
     return limits
 
 
-def save_centering_centers_plot(centers_yx, valid, boundary_hit, image_shape, path,
-                                *, retained=None, max_distance_pixels=None):
-    """Plot every valid estimated center in the original image coordinates."""
-    import matplotlib.pyplot as plt
-
-    centers = np.asarray(centers_yx, dtype=np.float64)
-    valid = np.asarray(valid)
-    boundary = np.asarray(boundary_hit)
-    shape = np.asarray(image_shape)
-    if centers.ndim != 2 or centers.shape[1] != 2:
-        raise ValueError("centers_yx must have shape (n_images, 2)")
-    if valid.shape != (len(centers),) or boundary.shape != valid.shape:
-        raise ValueError("valid and boundary_hit must have one flag per center")
-    if not np.all(np.isin(valid, [False, True])) or not np.all(
-            np.isin(boundary, [False, True])):
-        raise ValueError("valid and boundary_hit must contain Boolean flags")
-    if (shape.shape != (2,) or not np.issubdtype(shape.dtype, np.integer)
-            or np.any(shape < 1)):
-        raise ValueError("image_shape must contain two positive integer dimensions")
-    height, width = map(int, shape)
-    valid = valid.astype(bool)
-    boundary = boundary.astype(bool)
-    finite = np.all(np.isfinite(centers), axis=1)
-    plotted = valid & finite
-    if np.any((centers[plotted] < 0) | (centers[plotted] > shape - 1)):
-        raise ValueError("valid estimated centers must lie inside the image grid")
-    interior = plotted & ~boundary
-    boundary = plotted & boundary
-    rejected = np.zeros(len(centers), dtype=bool)
-    if retained is not None:
-        retained = np.asarray(retained)
-        if retained.shape != valid.shape or retained.dtype.kind != "b":
-            raise ValueError("retained must contain one Boolean flag per center")
-        rejected = plotted & ~retained
-        interior &= retained
-        boundary &= retained
-    path = Path(path)
-    if path.suffix.lower() != ".pdf":
-        raise ValueError("centering center scatter must be saved as a PDF")
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    fig, axis = plt.subplots(figsize=(5.2, 5.2))
-    try:
-        if np.any(interior):
-            axis.scatter(centers[interior, 1], centers[interior, 0], s=7,
-                         c="#202020", alpha=0.6, linewidths=0,
-                         rasterized=True, label="Estimated center")
-        if np.any(boundary):
-            axis.scatter(centers[boundary, 1], centers[boundary, 0], s=12,
-                         c="#d95f02", alpha=0.9, linewidths=0,
-                         rasterized=True, label="Boundary hit")
-        if np.any(rejected):
-            axis.scatter(centers[rejected, 1], centers[rejected, 0], s=10,
-                         c="#c62828", alpha=0.75, linewidths=0,
-                         rasterized=True, label="Discarded")
-        if max_distance_pixels is not None:
-            from matplotlib.patches import Circle
-
-            axis.add_patch(Circle(
-                (width // 2, height // 2), max_distance_pixels,
-                fill=False, color="#1565c0", linewidth=1.3,
-                label="Distance threshold"))
-        axis.scatter([width // 2], [height // 2], marker="+", s=130,
-                     c="#1565c0", linewidths=1.8, label="Box center", zorder=3)
-        axis.set_xlim(-0.5, width - 0.5)
-        axis.set_ylim(height - 0.5, -0.5)
-        axis.set_aspect("equal")
-        axis.set_xlabel("x (column)")
-        axis.set_ylabel("y (row)")
-        axis.legend(loc="upper right", framealpha=0.9, fontsize="small")
-        fig.tight_layout()
-        fig.savefig(path, bbox_inches="tight", dpi=300)
-    finally:
-        plt.close(fig)
-    return {
-        "image_shape_yx": [height, width],
-        "target_center_yx": [height // 2, width // 2],
-        "n_input": int(len(centers)),
-        "n_valid": int(np.count_nonzero(valid)),
-        "n_plotted": int(np.count_nonzero(plotted)),
-        "n_invalid_excluded": int(np.count_nonzero(~valid)),
-        "n_nonfinite_excluded": int(np.count_nonzero(valid & ~finite)),
-        "n_boundary": int(np.count_nonzero(boundary)),
-        "n_interior": int(np.count_nonzero(interior)),
-        "n_discarded_plotted": int(np.count_nonzero(rejected)),
-        "max_distance_pixels": max_distance_pixels,
-        "coordinate_convention": "zero-based original image pixels; x=column, y=row; y increases downward",
-        "extent_xy": [-0.5, width - 0.5, -0.5, height - 0.5],
-        "sampling": "all valid finite estimated centers, without subsampling or jitter",
-        "scatter_rasterized_in_pdf": True,
-        "title": None,
-    }
-
-
 def denoise_relion_particles(config: FastCWFDenoiseConfig) -> FastCWFDenoiseResult:
     """Denoise a reproducibly selected RELION particle subset.
 
@@ -714,19 +582,6 @@ def denoise_relion_particles(config: FastCWFDenoiseConfig) -> FastCWFDenoiseResu
         raise ValueError("denoise resolution cannot exceed native particle size")
     source_rows = select_rows(particles.n, args.n_images, args.seed)
     n_images = len(source_rows)
-    n_images_before_centering_filter = n_images
-    centering_keep = np.ones(n_images, dtype=bool)
-    centering_filter = {
-        "enabled": args.centering_max_distance_fraction is not None,
-        "max_distance_fraction": args.centering_max_distance_fraction,
-        "max_distance_denoise_pixels": (
-            None if args.centering_max_distance_fraction is None else
-            args.centering_max_distance_fraction * args.denoise_res),
-        "distance": "Euclidean distance from the pre-translation center to (H//2,W//2)",
-        "stage": "after center estimation, before noise PSD, FastPCA covariance and denoising",
-        "invalid_estimates_discarded": args.centering_max_distance_fraction is not None,
-    }
-    centering_rejected_source_rows = np.empty(0, dtype=np.int64)
     source_fingerprint = particles.fingerprint()
     image_names = particles.image_names[source_rows].copy()
     parameters = np.column_stack(
@@ -737,7 +592,7 @@ def denoise_relion_particles(config: FastCWFDenoiseConfig) -> FastCWFDenoiseResu
         raise ValueError("FastPCA radial CTF does not support nonzero STAR phase shifts")
     selected_origins = np.empty((0, 2), dtype=np.float64)
     origin_source = None
-    image_centering = args.centering_radius is not None
+    image_centering = bool(args.centering)
     centering_method = (CENTERING_METHOD if image_centering else
                         "relion_origins" if args.recenter_from_star else "none")
     recentering = {
@@ -864,19 +719,14 @@ def denoise_relion_particles(config: FastCWFDenoiseConfig) -> FastCWFDenoiseResu
     background_stds = np.empty(n_images, dtype=np.float64)
     noise_psd_sum = np.zeros(basis.pts.shape[0], dtype=np.float64)
     applied_shifts_denoise = selected_origins * (args.denoise_res / particles.res)
-    centering_centers = np.empty((0, 2), dtype=np.float64)
-    centering_scores = np.empty(0, dtype=np.float64)
-    centering_valid = np.empty(0, dtype=bool)
-    centering_boundary = np.empty(0, dtype=bool)
     centering_seconds = 0.0
     centering_setup_seconds = 0.0
     centering_diagnostic = None
-    centering_centers_scatter_info = None
     centering_inference = None
     centering_inference_psd = None
     if image_centering:
         from .centering import (CenteringConfig, apply_image_shifts,
-                               centering_distance_mask, estimate_dataset_shifts,
+                               estimate_dataset_shifts,
                                estimate_background_noise_psd)
 
         centering_output = (
@@ -898,38 +748,21 @@ def denoise_relion_particles(config: FastCWFDenoiseConfig) -> FastCWFDenoiseResu
         centering_ctfs = fastpca_radial_ctf_grid(
             args.denoise_res, voxel_size, radial_parameters)
         applied_shifts_denoise = np.zeros((n_images, 2), dtype=np.float64)
-        centering_centers = np.empty((n_images, 2), dtype=np.float64)
-        centering_scores = np.empty(n_images, dtype=np.float64)
-        centering_valid = np.empty(n_images, dtype=bool)
-        centering_boundary = np.empty(n_images, dtype=bool)
         recentering.update({
-            "radius_denoise_pixels": int(args.centering_radius),
-            "max_shift_denoise_pixels": (
-                None if args.centering_max_shift is None
-                else int(args.centering_max_shift)),
-            "individual_residuals": bool(args.centering_individual),
-            "ctf_mode": args.centering_ctf_mode,
-            "wiener_balance": (args.centering_wiener_balance
-                               if args.centering_ctf_mode == "wiener" else None),
             "ctf_for_estimator": "FastPCA radial binned mean-defocus; H(0)=-alpha",
             "ctf_wavelength_angstrom": "12.2643247/sqrt(voltage_kV*1e3+0.978466*voltage_kV**2)",
             "estimator_contrast_sign": -1.0 if args.flip_sign else 1.0,
             "phase_flip_applied_to_observations": False,
             "observations_modified_only_by_translation": True,
-            "invalid_estimate_displacement": "common correction only; uncertain residuals are suppressed",
-            "boundary_estimate_policy": "shrink residual shifts and retain boundary flags; no automatic rejection",
-            "center_coordinates": "box center minus total applied XY correction, reversed to YX; not a calibrated physical center",
-            "valid_semantics": "finite applied correction, including a guarded zero; raw residual validity is stored separately",
+            "uncertain_estimate_displacement": "zero: the common correction is kept only when image splits and frequency bands agree",
+            "center_coordinates": "box center minus the applied common XY correction, reversed to YX; not a calibrated physical center",
             "boundary_condition": "periodic Fourier translation; no padding or cropping beyond downsampling",
             "stage": "after all raw images are downsampled; before production background subtraction, PSD and CWF",
         })
-        if centering_filter["enabled"]:
-            recentering["boundary_estimate_policy"] = (
-                "apply shift only to retained observations; distance/validity gate decides retention")
         centering_setup_seconds = time.monotonic() - centering_started
         print(
-            f"Guarded common + noise-calibrated FB residual centering: radius={args.centering_radius} denoise pixels; "
-            "CTF/noise weighting changes estimator copies only; no STAR origins, angles, or reference map",
+            "Guarded common-shift centering; CTF/noise weighting changes estimator copies only; "
+            "no STAR origins, angles, or reference map",
             flush=True,
         )
     load_psd_started = time.monotonic()
@@ -972,26 +805,11 @@ def denoise_relion_particles(config: FastCWFDenoiseConfig) -> FastCWFDenoiseResu
         centering_preview_before[:] = observations[:centering_preview_count]
         centering_inference_psd, centering_radial_psd = estimate_background_noise_psd(
             observations, background_radius=args.background_radius, batch_size=args.batch_size)
-        residual_limit = (max(2, args.centering_radius // 4)
-                          if args.centering_max_shift is None else args.centering_max_shift)
-        centering_config = CenteringConfig(
-            individual_centering=bool(args.centering_individual), support_radius_fraction=args.centering_radius / args.denoise_res,
-            residual_max_shift_fraction=residual_limit / args.denoise_res,
-            wiener_balance=args.centering_wiener_balance, ctf_mode=args.centering_ctf_mode,
-            contrast_sign=-1 if args.flip_sign else 1,
-            device=args.device, fle_root=str(args.fle_root))
+        centering_config = CenteringConfig(contrast_sign=-1 if args.flip_sign else 1)
         centering_inference, centering_algorithm = estimate_dataset_shifts(
             observations, centering_ctfs, centering_inference_psd,
             ctf_indices=ctf_ids, config=centering_config)
         applied_shifts_denoise = centering_inference["shifts_xy"]
-        centering_centers[:] = args.denoise_res // 2 - applied_shifts_denoise[:, ::-1]
-        centering_valid[:] = np.all(np.isfinite(applied_shifts_denoise), axis=1)
-        centering_boundary[:] = centering_inference["residual_boundary"]
-        centering_scores[:] = centering_inference["residual_scores"]
-        if centering_filter["enabled"]:
-            centering_keep[:], _ = centering_distance_mask(
-                centering_centers, centering_valid, observations.shape[1:],
-                args.centering_max_distance_fraction)
         recentering["algorithm"] = centering_algorithm
         recentering["inference_noise_psd"] = {
             "method": "radial background masked periodogram on uncorrected raw observations",
@@ -1005,7 +823,6 @@ def denoise_relion_particles(config: FastCWFDenoiseConfig) -> FastCWFDenoiseResu
         }
         print(
             f"Centering common correction XY={centering_inference['common_shift_xy'].tolist()}; "
-            f"individual shrinkage={centering_algorithm['individual_shrinkage_factor']}; "
             f"common guard={centering_algorithm['common'].get('guard_passed', False)}",
             flush=True)
         centering_seconds += time.monotonic() - centering_started
@@ -1021,26 +838,13 @@ def denoise_relion_particles(config: FastCWFDenoiseConfig) -> FastCWFDenoiseResu
             observations[start:end] = images
             background_means[start:end] = means
             background_stds[start:end] = stds
-            retained_batch = observations[start:end][centering_keep[start:end]]
-            if len(retained_batch):
-                noise_psd_sum += np.sum(psd_estimator(retained_batch), axis=0, dtype=np.float64)
+            noise_psd_sum += np.sum(psd_estimator(observations[start:end]), axis=0, dtype=np.float64)
             print(f"Centered/background/PSD {end:,}/{n_images:,}", flush=True)
-    n_retained = int(np.count_nonzero(centering_keep))
-    if n_retained < 2:
-        raise ValueError("centering-distance rejection left fewer than two images")
-    noise_psd = noise_psd_sum / n_retained
-    centering_filter.update(
-        n_input=n_images, n_retained=n_retained, n_rejected=n_images - n_retained,
-        n_invalid_rejected=int(np.count_nonzero(
-            ~centering_valid & ~centering_keep)) if image_centering else 0,
-        rejected_fraction=float(np.mean(~centering_keep)),
-    )
+    noise_psd = noise_psd_sum / n_images
     load_psd_seconds = time.monotonic() - load_psd_started
     if image_centering:
         shift_norms = np.linalg.norm(applied_shifts_denoise, axis=1)
         recentering.update({
-            "valid_fraction": float(np.mean(centering_valid)),
-            "boundary_hit_fraction": float(np.mean(centering_boundary)),
             "shift_norm_denoise_pixels": {
                 "minimum": float(np.min(shift_norms)),
                 "median": float(np.median(shift_norms)),
@@ -1050,42 +854,28 @@ def denoise_relion_particles(config: FastCWFDenoiseConfig) -> FastCWFDenoiseResu
             "setup_seconds": centering_setup_seconds,
         })
         print(
-            f"Image-based centering: valid={np.count_nonzero(centering_valid):,}/{n_images:,}; "
-            f"boundary hits={np.count_nonzero(centering_boundary):,}; "
-            f"shift norm median/max={np.median(shift_norms):.4g}/{np.max(shift_norms):.4g} "
+            f"Global centering: shift norm median/max={np.median(shift_norms):.4g}/{np.max(shift_norms):.4g} "
             f"denoise pixels; estimation/application={centering_seconds:.2f} s",
             flush=True,
         )
         centering_preview_path = centering_output / "before_after.pdf"
         centering_preview_cache = centering_output / "preview.npz"
         centering_report_path = centering_output / "report.json"
-        centering_centers_path = centering_output / "estimated_centers.pdf"
         centering_estimates_path = centering_output / "estimates.npz"
         np.savez_compressed(
             centering_estimates_path,
             source_rows=source_rows, image_names=image_names,
-            centers_yx=centering_centers, valid=centering_valid,
-            scores=centering_scores,
             applied_shifts_xy_denoise_pixels=applied_shifts_denoise,
-            boundary_hit=centering_boundary, retained=centering_keep,
-            distances_pixels=np.linalg.norm(applied_shifts_denoise, axis=1),
-            max_distance_fraction=(
-                np.nan if args.centering_max_distance_fraction is None else
-                args.centering_max_distance_fraction),
             inference_noise_psd=centering_inference_psd,
             **centering_inference,
         )
+        preview_centers = (
+            args.denoise_res // 2
+            - applied_shifts_denoise[:centering_preview_count, ::-1])
         preview_limits = save_centering_preview(
             centering_preview_before, centering_preview_after,
             centering_preview_path,
-            estimated_centers_yx=(
-                centering_centers[:centering_preview_count]),
-        )
-        centering_centers_scatter_info = save_centering_centers_plot(
-            centering_centers, centering_valid, centering_boundary,
-            (args.denoise_res, args.denoise_res), centering_centers_path,
-            retained=centering_keep if centering_filter["enabled"] else None,
-            max_distance_pixels=centering_filter["max_distance_denoise_pixels"],
+            estimated_centers_yx=preview_centers,
         )
         np.savez_compressed(
             centering_preview_cache,
@@ -1095,22 +885,19 @@ def denoise_relion_particles(config: FastCWFDenoiseConfig) -> FastCWFDenoiseResu
             image_names=image_names[:centering_preview_count],
             applied_shifts_xy_denoise_pixels=(
                 applied_shifts_denoise[:centering_preview_count]),
-            estimated_centers_yx_denoise_pixels=(
-                centering_centers[:centering_preview_count]),
+            estimated_centers_yx_denoise_pixels=preview_centers,
         )
         centering_diagnostic = {
             "directory": str(centering_output),
             "preview": str(centering_preview_path),
             "preview_cache": str(centering_preview_cache),
             "report": str(centering_report_path),
-            "centers_scatter": str(centering_centers_path),
             "estimates": str(centering_estimates_path),
         }
         centering_report_path.write_text(json.dumps({
             "dataset": args.dataset_label,
             "n_total_particles": particles.n,
             "n_images_centered": n_images,
-            "n_images_retained": n_retained,
             "all_images_entering_covariance_centered": True,
             "n_preview": centering_preview_count,
             "preview_source_rows_zero_based": source_rows[:centering_preview_count].tolist(),
@@ -1119,43 +906,9 @@ def denoise_relion_particles(config: FastCWFDenoiseConfig) -> FastCWFDenoiseResu
             "preview_grayscale_limits_per_pair": preview_limits,
             "full_shift_manifest": str(centering_estimates_path),
             "recentering": recentering,
-            "centering_filter": centering_filter,
             "diagnostics": centering_diagnostic,
-            "centers_scatter_info": centering_centers_scatter_info,
         }, indent=2) + "\n")
         print(f"Centering before/after preview: {centering_preview_path}", flush=True)
-        print(f"All-image centering scatter: {centering_centers_path}", flush=True)
-    if centering_filter["enabled"]:
-        print(
-            f"Centering-distance gate: cutoff={centering_filter['max_distance_denoise_pixels']:g} "
-            f"denoise pixels ({args.centering_max_distance_fraction:.1%} of side); "
-            f"retained={n_retained:,}/{n_images:,}; discarded={n_images - n_retained:,} "
-            f"({centering_filter['rejected_fraction']:.2%}); "
-            "PSD and covariance use retained images only",
-            flush=True)
-        centering_rejected_source_rows = source_rows[~centering_keep].copy()
-        observations = observations[centering_keep]
-        source_rows = source_rows[centering_keep]
-        image_names = image_names[centering_keep]
-        parameters = parameters[centering_keep]
-        phase_shifts = phase_shifts[centering_keep]
-        background_means = background_means[centering_keep]
-        background_stds = background_stds[centering_keep]
-        applied_shifts_denoise = applied_shifts_denoise[centering_keep]
-        centering_centers = centering_centers[centering_keep]
-        centering_scores = centering_scores[centering_keep]
-        centering_valid = centering_valid[centering_keep]
-        centering_boundary = centering_boundary[centering_keep]
-        n_images = n_retained
-        sampling += "_then_centering_distance_filter"
-        # Compact every particle identity and rebuild CTF grouping together.
-        (radial_parameters, ctf_ids, order, inverse, starts, counts, exact_mean,
-         effective_mean) = group_radial_ctfs(parameters, args.ctf_mean_defocus_bin)
-        astigmatism, astig_bound, quantization_bound = ctf_phase_error_bounds(
-            parameters, effective_mean, voxel_size)
-        filters = [SimpleNamespace(
-            voltage=row[0], Cs=row[1], alpha=row[2], defocus_mean=row[3],
-            pixel_size=voxel_size) for row in radial_parameters]
     if not np.all(np.isfinite(background_stds)) or np.any(background_stds <= 0):
         raise FloatingPointError("selected-image background noise has invalid/zero variance")
     if not np.all(np.isfinite(noise_psd)) or np.any(noise_psd <= 0):
@@ -1231,12 +984,6 @@ def denoise_relion_particles(config: FastCWFDenoiseConfig) -> FastCWFDenoiseResu
         image_names=image_names,
         n_total=particles.n,
         n_images=n_images,
-        n_images_before_centering_filter=n_images_before_centering_filter,
-        centering_max_distance_fraction=(
-            -1.0 if args.centering_max_distance_fraction is None else
-            args.centering_max_distance_fraction),
-        centering_filter=json.dumps(centering_filter, sort_keys=True),
-        centering_rejected_source_rows=centering_rejected_source_rows,
         seed=args.seed,
         sampling=sampling,
         native_res=particles.res,
@@ -1299,19 +1046,6 @@ def denoise_relion_particles(config: FastCWFDenoiseConfig) -> FastCWFDenoiseResu
         image_centering_enabled=image_centering,
         centering_method=centering_method,
         centering_method_version=CENTERING_METHOD_VERSION if image_centering else 0,
-        centering_radius_denoise_pixels=(
-            -1 if args.centering_radius is None else args.centering_radius),
-        centering_max_shift_denoise_pixels=(
-            -1 if args.centering_max_shift is None else args.centering_max_shift),
-        centering_individual=bool(args.centering_individual),
-        centering_ctf_mode=(args.centering_ctf_mode if image_centering else "none"),
-        centering_wiener_balance=(
-            args.centering_wiener_balance
-            if image_centering and args.centering_ctf_mode == "wiener" else -1.0),
-        centering_centers_yx_denoise_pixels=centering_centers,
-        centering_scores=centering_scores,
-        centering_valid=centering_valid,
-        centering_boundary_hit=centering_boundary,
         relion_origin_source=json.dumps(origin_source, sort_keys=True),
         relion_origins_xy_native_pixels=selected_origins,
         applied_shifts_xy_native_pixels=(
@@ -1365,9 +1099,6 @@ def denoise_relion_particles(config: FastCWFDenoiseConfig) -> FastCWFDenoiseResu
         "fastpca_backend": fastpca_backend,
         "fle_precision": basis.precision,
         "n_images": n_images,
-        "n_images_before_centering_filter": n_images_before_centering_filter,
-        "centering_max_distance_fraction": args.centering_max_distance_fraction,
-        "centering_filter": centering_filter,
         "n_total": particles.n,
         "seed": args.seed,
         "sampling": sampling,
@@ -1415,15 +1146,7 @@ def denoise_relion_particles(config: FastCWFDenoiseConfig) -> FastCWFDenoiseResu
         "image_centering_enabled": image_centering,
         "centering_method": centering_method,
         "centering_method_version": CENTERING_METHOD_VERSION if image_centering else 0,
-        "centering_radius_denoise_pixels": args.centering_radius,
-        "centering_max_shift_denoise_pixels": args.centering_max_shift,
-        "centering_individual": (bool(args.centering_individual) if args.centering_radius is not None else None),
-        "centering_ctf_mode": (args.centering_ctf_mode if image_centering else None),
-        "centering_wiener_balance": (
-            args.centering_wiener_balance
-            if image_centering and args.centering_ctf_mode == "wiener" else None),
         "centering_diagnostic": centering_diagnostic,
-        "centering_centers_scatter_info": centering_centers_scatter_info,
         "recentering": recentering,
         "reference_used": False,
         "reference_map_used": False,
@@ -1462,7 +1185,7 @@ def denoise_relion_particles(config: FastCWFDenoiseConfig) -> FastCWFDenoiseResu
     if image_centering:
         report["implementation"]["centering"] = _code_identity(PACKAGE_DIR / "centering.py")
         report["caveats"].append(
-            "Image-estimated shifts depend on noisy observations; residual shifts need not be Gaussian or independent of signal."
+            "The common shift is estimated from noisy observations; per-image shifts stay in the images and are modeled in the moments."
         )
     report_path = output / "report.json"
     report_path.write_text(json.dumps(report, indent=2) + "\n")

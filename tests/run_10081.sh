@@ -13,7 +13,7 @@
 #SBATCH --mail-user=yw3384@princeton.edu
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --export=NONE
-#SBATCH --chdir=/home/yw3384/softwares/Kam-cryoEM-FB
+#SBATCH --chdir=/home/yw3384/softwares/denoised_kam
 #SBATCH --output=/dev/null
 #SBATCH --error=/dev/null
 
@@ -32,19 +32,23 @@ export OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 OMP_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1 PYTHONUNBUFFERED=1 SLURM_EXPORT_ENV=ALL
 command -v kam >/dev/null
 
-# MoM initializer.
+# MoM initializer: global (common) shift correction only, the remaining shifts are modeled by a shift distribution on rings
+# (0.25 px spacing up to a quarter of the radius of the 20x20 moment images) fitted jointly in the M3 stage.
 kam pipeline /scratch/gpfs/CRYOEM/gilleslab/mg6942/em_fixtures/empiar_10081_hcn1/particles.star \
   --dataset-label EMPIAR-10081 \
   --datadir /scratch/gpfs/CRYOEM/gilleslab/mg6942/em_fixtures/empiar_10081_hcn1 \
   --outdir "$RESULTS" \
   --n-select 10000 \
   --denoise-res 64 \
-  --centering \
+  --do-global-centering \
   --vol-degree 7 \
   --viewing-degree 2 \
   --moment-res 20 \
   --augment-reflections \
   --n-init 3 \
+  --maxiter 10000 \
+  --shift-distribution \
+  --shift-step-px 0.25 \
   --device gpu \
   --workers 16 \
   "$@"

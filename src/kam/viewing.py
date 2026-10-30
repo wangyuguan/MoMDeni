@@ -480,7 +480,7 @@ def fit_single_moment_low_degree(
 
     options = dict(
         maxiter=int(maxiter), maxfun=max(15000, 20 * int(maxiter)),
-        ftol=1e-12, gtol=1e-10, maxcor=100,
+        ftol=1e-10, gtol=1e-10, maxcor=100,
     )
     result = minimize(
         objective, x0, jac=True, method="L-BFGS-B", callback=callback,

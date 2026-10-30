@@ -45,7 +45,6 @@ from .centering import (METHOD as CENTERING_METHOD,
                         CenteringConfig)
 from .denoise import (CENTERING_PREVIEW_DESCRIPTION,
                      CENTERING_PREVIEW_MARKER_SEMANTICS,
-                     DEFAULT_FLE_ROOT,
                      FastCWFDenoiseConfig, denoise_relion_particles,
                      save_centering_preview)
 from . import postprocessing
@@ -87,7 +86,7 @@ DEFAULT_ELL_MAX = 5
 DEFAULT_VIEWING_DEGREE = 2
 DEFAULT_SPHERE_NODES = 200
 DEFAULT_N_INIT = 1
-DEFAULT_MAXITER = 5_000
+DEFAULT_MAXITER = 10_000
 DEFAULT_MAX_M3_ENTRIES = 10_000_000
 DEFAULT_NEIGHBOR_FRACTION = 280.0 / 380.0
 PIPELINE_HEARTBEAT_SECONDS = 60.0
@@ -252,16 +251,7 @@ def _centering_algorithm_configuration(args: argparse.Namespace) -> dict | None:
         return None
     from dataclasses import asdict
 
-    return asdict(CenteringConfig(
-        individual_centering=bool(args.centering_individual),
-        support_radius_fraction=args.centering_radius / args.denoise_res,
-        residual_max_shift_fraction=args.centering_max_shift / args.denoise_res,
-        ctf_mode=args.centering_ctf_mode,
-        wiener_balance=args.centering_wiener_balance,
-        contrast_sign=-1 if args.flip_sign else 1,
-        device=args.device,
-        fle_root=str(getattr(args, "fle_root", DEFAULT_FLE_ROOT)),
-    ))
+    return asdict(CenteringConfig(contrast_sign=-1 if args.flip_sign else 1))
 
 
 def _configuration(args: argparse.Namespace) -> dict:
@@ -289,15 +279,6 @@ def _configuration(args: argparse.Namespace) -> dict:
                 "method": CENTERING_METHOD if args.centering else "none",
                 "method_version": CENTERING_METHOD_VERSION if args.centering else None,
                 "algorithm_configuration": _centering_algorithm_configuration(args),
-                "radius_denoise_pixels": args.centering_radius,
-                "max_shift_denoise_pixels": args.centering_max_shift,
-                "individual_residuals": (args.centering_individual if args.centering else None),
-                "ctf_mode": args.centering_ctf_mode if args.centering else None,
-                "wiener_balance": (
-                    args.centering_wiener_balance
-                    if args.centering and args.centering_ctf_mode == "wiener"
-                    else None),
-                "max_distance_fraction": args.centering_max_distance_fraction,
                 "relion_origins_used": False,
                 "orientation_angles_used": False,
                 "reference_map_used": False,
@@ -357,21 +338,11 @@ def _denoise_command(args, paths):
         "--background-radius", str(args.background_radius),
         "--ctf-mean-defocus-bin", str(args.ctf_mean_defocus_bin),
         "--flip-sign" if args.flip_sign else "--no-flip-sign",
-        "--centering" if args.centering else "--no-centering",
+        "--do-global-centering" if args.centering else "--no-do-global-centering",
         "--outdir", str(paths["denoising"]),
     ]
     if args.centering:
-        command.extend(["--centering-radius", str(args.centering_radius)])
-        command.extend(["--centering-max-shift", str(args.centering_max_shift)])
-        command.append("--centering-individual" if args.centering_individual
-                       else "--no-centering-individual")
-        command.extend(["--centering-ctf-mode", args.centering_ctf_mode])
-        command.extend(["--centering-wiener-balance",
-                        str(args.centering_wiener_balance)])
         command.extend(["--centering-output-dir", str(paths["centering"])])
-        if args.centering_max_distance_fraction is not None:
-            command.extend(["--centering-max-distance-fraction",
-                            str(args.centering_max_distance_fraction)])
     if args.data_folder is not None:
         command.extend(["--datadir", str(args.data_folder.expanduser().resolve())])
     if args.stack_prefix is not None:
@@ -583,11 +554,8 @@ def _denoising_complete(path: Path, args: argparse.Namespace) -> bool:
             or report.get("fastpca_backend") != expected_backend
             or report.get("fle_precision") != "single"
             or bool(report.get("flip_sign")) != args.flip_sign
-            or int(report.get("n_images_before_centering_filter", report.get("n_images", -1)))
-            != int(report.get("n_total", -2))
-            or report.get("sampling") != (
-                "all_STAR_rows_then_centering_distance_filter"
-                if args.centering_max_distance_fraction is not None else "all_STAR_rows")
+            or int(report.get("n_images", -1)) != int(report.get("n_total", -2))
+            or report.get("sampling") != "all_STAR_rows"
             or not math.isclose(
                 float(report.get("ctf_mean_defocus_bin_angstrom", math.nan)),
                 args.ctf_mean_defocus_bin, rel_tol=0.0, abs_tol=1e-12)):
@@ -633,7 +601,6 @@ def _ensure_centering_diagnostic(denoising_path, denoising_report):
         "preview": str(directory / "before_after.pdf"),
         "preview_cache": str(directory / "preview.npz"),
         "report": str(directory / "report.json"),
-        "centers_scatter": str(directory / "estimated_centers.pdf"),
         "estimates": str(directory / "estimates.npz"),
     }
     if denoising_report.get("centering_diagnostic") != expected:
@@ -642,10 +609,7 @@ def _ensure_centering_diagnostic(denoising_path, denoising_report):
         raise FileNotFoundError(f"centering preview cache or report is missing: {directory}")
     report = _read_json(Path(expected["report"]))
     n_images = int(denoising_report["n_images"])
-    n_input = int(denoising_report.get("n_images_before_centering_filter", n_images))
-    if (report.get("n_images_centered") != n_input
-            or report.get("n_images_retained") != n_images
-            or report.get("centering_filter") != denoising_report.get("centering_filter")
+    if (report.get("n_images_centered") != n_images
             or report.get("all_images_entering_covariance_centered") is not True
             or report.get("recentering") != denoising_report.get("recentering")):
         raise ValueError("centering diagnostics disagree with the denoising provenance")
@@ -663,13 +627,12 @@ def _ensure_centering_diagnostic(denoising_path, denoising_report):
                 if "estimated_centers_yx_denoise_pixels" in saved.files else None
             )
             side = int(denoising_report["denoise_res"])
-            if before.shape != (min(8, n_input), side, side):
+            if before.shape != (min(8, n_images), side, side):
                 raise ValueError("centering preview cache has an unexpected image shape")
         if cached_centers is None:
             with np.load(denoising_path / "manifest.npz", allow_pickle=False) as saved:
-                cached_centers = np.asarray(
-                    saved["centering_centers_yx_denoise_pixels"]
-                )[:len(before)]
+                cached_centers = (
+                    side // 2 - np.asarray(saved["applied_shifts_xy_denoise_pixels"])[:len(before), ::-1])
         save_centering_preview(
             before, after, preview_path,
             estimated_centers_yx=cached_centers,
@@ -680,31 +643,11 @@ def _ensure_centering_diagnostic(denoising_path, denoising_report):
             _write_json_atomic(Path(expected["report"]), report)
         action = "updated" if preview_semantics_changed else "restored"
         print(f"[pipeline] {action} centering preview: {preview_path}", flush=True)
-    scatter_path = Path(expected["centers_scatter"])
-    if not scatter_path.is_file():
-        from .denoise import save_centering_centers_plot
-
-        with np.load(expected["estimates"], allow_pickle=False) as saved:
-            centers = np.asarray(saved["centers_yx"])
-            if centers.shape != (n_input, 2):
-                raise ValueError("centering scatter requires all input-image centers")
-            side = int(denoising_report["denoise_res"])
-            save_centering_centers_plot(
-                centers, saved["valid"], saved["boundary_hit"],
-                (side, side), scatter_path,
-                retained=saved["retained"],
-                max_distance_pixels=denoising_report["centering_filter"][
-                    "max_distance_denoise_pixels"])
-        print(f"[pipeline] restored centering scatter: {scatter_path}", flush=True)
 
 
 def _validate_denoising_centering(report, saved, args) -> None:
     """Never reuse a stack with different centering or pose provenance."""
     expected_method = CENTERING_METHOD if args.centering else "none"
-    expected_radius = args.centering_radius if args.centering else None
-    expected_distance = args.centering_max_distance_fraction
-    if report.get("centering_max_distance_fraction") != expected_distance:
-        raise ValueError("completed denoising used a different centering-distance threshold")
     for key in ("relion_poses_used", "relion_orientation_angles_used",
                 "relion_origins_used", "recenter_from_star", "reference_used"):
         if (report.get(key) is not False or key not in saved
@@ -713,32 +656,12 @@ def _validate_denoising_centering(report, saved, args) -> None:
                 or bool(saved[key])):
             raise ValueError(
                 f"completed denoising has missing or incompatible provenance: {key}")
-    expected_max_shift = args.centering_max_shift if args.centering else None
-    expected_individual = args.centering_individual if args.centering else None
-    expected_ctf_mode = args.centering_ctf_mode if args.centering else None
-    expected_balance = (args.centering_wiener_balance
-                        if args.centering and expected_ctf_mode == "wiener" else None)
     if (report.get("image_centering_enabled") is not args.centering
-            or report.get("centering_method") != expected_method
-            or report.get("centering_radius_denoise_pixels") != expected_radius
-            or report.get("centering_max_shift_denoise_pixels") != expected_max_shift
-            or report.get("centering_individual", True if args.centering else None) != expected_individual
-            or report.get("centering_ctf_mode") != expected_ctf_mode
-            or report.get("centering_wiener_balance") != expected_balance):
-        raise ValueError("completed denoising used different image centering settings")
+            or report.get("centering_method") != expected_method):
+        raise ValueError("completed denoising used different centering settings")
     expected_manifest = {
         "image_centering_enabled": args.centering,
         "centering_method": expected_method,
-        "centering_radius_denoise_pixels": (
-            expected_radius if args.centering else -1),
-        "centering_max_shift_denoise_pixels": (
-            -1 if expected_max_shift is None else expected_max_shift),
-        "centering_ctf_mode": (
-            "none" if expected_ctf_mode is None else expected_ctf_mode),
-        "centering_wiener_balance": (
-            -1.0 if expected_balance is None else expected_balance),
-        "centering_max_distance_fraction": (
-            -1.0 if expected_distance is None else expected_distance),
     }
     if args.centering:
         expected_manifest["centering_method_version"] = CENTERING_METHOD_VERSION
@@ -771,47 +694,16 @@ def _validate_denoising_centering(report, saved, args) -> None:
         raise ValueError("denoising manifest has invalid centering provenance") from error
     if manifest_recentering != recentering:
         raise ValueError("denoising report and manifest disagree on centering provenance")
-    filtering = report.get("centering_filter")
-    if (not isinstance(filtering, dict)
-            or filtering.get("enabled") is not (expected_distance is not None)
-            or filtering.get("max_distance_fraction") != expected_distance
-            or filtering.get("n_retained") != int(report["n_images"])
-            or filtering.get("n_input") != int(report["n_images_before_centering_filter"])
-            or filtering.get("n_input") - filtering.get("n_rejected", -1)
-            != filtering.get("n_retained")
-            or json.loads(np.asarray(saved["centering_filter"]).item()) != filtering):
-        raise ValueError("denoising report and manifest disagree on centering rejection")
-    rejected_rows = np.asarray(saved["centering_rejected_source_rows"])
-    if (rejected_rows.shape != (filtering["n_rejected"],)
-            or np.intersect1d(rejected_rows, saved["source_rows"]).size):
-        raise ValueError("discarded particles overlap the retained image stack")
     if args.centering:
         count = int(report["n_images"])
-        for key in ("applied_shifts_xy_denoise_pixels",
-                    "centering_centers_yx_denoise_pixels"):
-            if (key not in saved or np.asarray(saved[key]).shape != (count, 2)
-                    or not np.all(np.isfinite(saved[key]))):
-                raise ValueError(f"denoising manifest has invalid centering coordinates: {key}")
-        # The common estimate and shrunk residuals are generally subpixel.
-        # Validate their geometry without rounding them to the legacy integer
-        # residual-centerer grid or bounding them by the residual search limit.
-        centers = np.asarray(saved["centering_centers_yx_denoise_pixels"])
-        shifts = np.asarray(saved["applied_shifts_xy_denoise_pixels"])
-        if not np.allclose(centers, args.denoise_res // 2 - shifts[:, ::-1],
-                           rtol=0, atol=1e-6):
-            raise ValueError("denoising manifest centers disagree with its total applied shifts")
-        for key in ("centering_valid", "centering_boundary_hit"):
-            if (key not in saved or np.asarray(saved[key]).shape != (count,)
-                    or np.asarray(saved[key]).dtype.kind != "b"):
-                raise ValueError(f"denoising manifest has invalid centering flags: {key}")
-        if expected_distance is not None:
-            from .centering import centering_distance_mask
-
-            keep, _ = centering_distance_mask(
-                saved["centering_centers_yx_denoise_pixels"], saved["centering_valid"],
-                (args.denoise_res, args.denoise_res), expected_distance)
-            if not np.all(keep):
-                raise ValueError("discarded centering estimates leaked into denoising")
+        key = "applied_shifts_xy_denoise_pixels"
+        if (key not in saved or np.asarray(saved[key]).shape != (count, 2)
+                or not np.all(np.isfinite(saved[key]))):
+            raise ValueError(f"denoising manifest has invalid centering coordinates: {key}")
+        shifts = np.asarray(saved[key])
+        if not np.allclose(shifts, shifts[:1], rtol=0, atol=1e-9):
+            raise ValueError("denoising manifest applied different shifts to different images; "
+                             "only a common shift is supported")
 
 
 def _selection_complete(path: Path, args: argparse.Namespace) -> bool:
@@ -1237,18 +1129,35 @@ def _reconstruct(args: argparse.Namespace, paths: dict[str, Path],
              args.viewing_degree, args.sphere_nodes, args.sphere_degree,
              args.n_init, args.maxiter, initial_fit)
     print("[pipeline] " + description, flush=True)
+    if order == 3:
+        print("[pipeline] shift distribution: "
+              + ("off" if not args.shift_distribution else
+                 f"rings every {args.shift_step_px} px up to "
+                 f"{'side/8' if args.shift_max_px is None else args.shift_max_px} px"), flush=True)
     if args.dry_run:
         return
     from .postprocessing import ReconstructionConfig, reconstruct_single_moment
 
-    reconstruct_single_moment(ReconstructionConfig(
+    config = ReconstructionConfig(
         prepared_dir=paths["prepared"], output_dir=output, order=order,
         ell_max=args.ell_max, viewing_degree=args.viewing_degree,
         sphere_nodes=args.sphere_nodes, sphere_degree=args.sphere_degree,
         n_init=args.n_init, maxiter=args.maxiter, device=args.device,
         seed=args.seed, resume=args.resume,
         initial_fit=initial_fit,
-    ))
+    )
+    shift = _shift_settings(args, paths["prepared"]) if order == 3 else None
+    if order != 3:
+        reconstruct_single_moment(config)
+    else:
+        _check_shift_settings(output.parent, shift)
+        if shift is None:
+            reconstruct_single_moment(config)
+        else:
+            from . import shift_distribution
+            with shift_distribution.shift_law(shift["step_px"], shift["max_px"]) as law:
+                reconstruct_single_moment(config)
+            shift_distribution.write_records(law, output / "shift_distribution.json")
     if not _fit_complete(output, args, order):
         raise RuntimeError(f"M{order} reconstruction returned incomplete outputs")
 
@@ -1265,75 +1174,13 @@ def _resolve_particles_argument(parser, args):
 
 def _add_centering_arguments(parser):
     parser.add_argument(
-        "--centering", action=argparse.BooleanOptionalAction, default=False,
-        help=("estimate a guarded dataset-wide shift plus replica-calibrated, "
-              "shrunk individual residuals before denoising, without RELION "
-              "poses, shifts or reference maps; disabled by default"))
-    parser.add_argument(
-        "--centering-radius", type=int,
-        help=("individual residual-centering support radius in denoising-grid "
-              "pixels (default: denoise-res // 4)"))
-    parser.add_argument(
-        "--centering-max-shift", type=int,
-        help=("bound on each individual residual-shift axis in denoising-grid "
-              "pixels (default: max(2, centering-radius // 4)); this does not "
-              "bound the separate guarded common-shift search"))
-    parser.add_argument(
-        "--centering-individual", action=argparse.BooleanOptionalAction, default=True,
-        help=("after the guarded common shift, also estimate shrunk individual "
-              "residual shifts (default); --no-centering-individual applies the "
-              "common shift only"))
-    parser.add_argument(
-        "--centering-ctf-mode", choices=("flip", "wiener"), default=None,
-        help=("individual residual-estimator CTF handling: 'flip' corrects "
-              "only the transfer sign; 'wiener' (default) also restores the CTF-suppressed "
-              "low-frequency mass with H/(H^2+balance)"))
-    parser.add_argument(
-        "--centering-wiener-balance", type=float, default=None,
-        help="noise-to-signal balance of the Wiener weight (default: 0.05)")
-    parser.add_argument(
-        "--centering-max-distance-fraction", type=float, default=None,
-        help=("discard invalid total centers and centers farther than this "
-              "fraction of image side from box center, after common plus "
-              "shrunk residual estimation and before PSD/covariance estimation; "
-              "omit to keep all centered images"))
+        "--do-global-centering", dest="centering",
+        action=argparse.BooleanOptionalAction, default=True,
+        help=("estimate a guarded shift common to the dataset and correct it before "
+              "denoising, without RELION poses, shifts or reference maps; "
+              "enabled by default. The remaining per-image shifts are not estimated: "
+              "they are modeled by the shift distribution in the M3 stage"))
 
-
-def _resolve_centering_arguments(parser, args):
-    if not args.centering:
-        if args.centering_radius is not None:
-            parser.error("--centering-radius cannot be combined with --no-centering")
-        if args.centering_max_shift is not None:
-            parser.error("--centering-max-shift requires --centering")
-        if args.centering_ctf_mode is not None:
-            parser.error("--centering-ctf-mode requires --centering")
-        if args.centering_wiener_balance is not None:
-            parser.error("--centering-wiener-balance requires --centering")
-        args.centering_ctf_mode = "wiener"
-        args.centering_wiener_balance = 0.05
-        if args.centering_max_distance_fraction is not None:
-            parser.error("--centering-max-distance-fraction requires --centering")
-        return
-    if args.centering_radius is None:
-        args.centering_radius = args.denoise_res // 4
-    if not 1 <= args.centering_radius <= (args.denoise_res - 1) // 2:
-        parser.error("centering-radius must be positive and its full support disk must fit denoise-res")
-    if args.centering_max_shift is None:
-        args.centering_max_shift = max(2, args.centering_radius // 4)
-    largest = args.denoise_res // 2 - args.centering_radius
-    if not 1 <= args.centering_max_shift <= largest:
-        parser.error(f"centering-max-shift must be in [1, {largest}] so every "
-                     "candidate disk fits inside the image")
-    if args.centering_ctf_mode is None:
-        args.centering_ctf_mode = "wiener"
-    if args.centering_wiener_balance is None:
-        args.centering_wiener_balance = 0.05
-    if (not math.isfinite(args.centering_wiener_balance)
-            or args.centering_wiener_balance <= 0):
-        parser.error("centering-wiener-balance must be finite and positive")
-    fraction = args.centering_max_distance_fraction
-    if fraction is not None and (not math.isfinite(fraction) or not 0 < fraction <= 0.5):
-        parser.error("centering-max-distance-fraction must be in (0, 0.5]")
 
 
 def _pipeline_parser() -> argparse.ArgumentParser:
@@ -1386,6 +1233,7 @@ def _pipeline_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--maxiter", type=int, default=DEFAULT_MAXITER,
         help="maximum L-BFGS iterations per initialization")
+    _add_shift_arguments(parser)
     parser.add_argument(
         "--device", choices=("cpu", "gpu"), default="gpu",
         help="backend for FastPCA FLE transforms and MoM computation")
@@ -1457,7 +1305,6 @@ def _validate_args(parser: argparse.ArgumentParser,
         parser.error(
             "denoise-res and moment-res must be even and >=4, with moment-res "
             "not exceeding denoise-res")
-    _resolve_centering_arguments(parser, args)
     if (args.ell_max < 0 or args.sphere_nodes < 1
             or args.n_init < 1 or args.maxiter < 1
             or args.max_m3_entries < 1):
@@ -1509,9 +1356,7 @@ def pipeline_main(argv=None) -> None:
         print(f"[pipeline] output={paths['root']} resume={args.resume}", flush=True)
         print(
             f"[pipeline] centering={args.centering} "
-            f"method={CENTERING_METHOD if args.centering else 'none'} "
-            f"residual_radius_denoise_pixels={args.centering_radius} "
-            f"residual_max_shift_denoise_pixels={args.centering_max_shift}; "
+            f"method={CENTERING_METHOD if args.centering else 'none'}; "
             "RELION origins/poses and reference maps are not used for centering",
             flush=True)
         try:
@@ -1614,8 +1459,7 @@ def _execute_pipeline(args, paths, invocation_started_utc, invocation_started):
                 "M3": str(paths["m3"] / "recon.mrc"),
             },
             "diagnostics": {
-                **({"centering_before_after": str(paths["centering"] / "before_after.pdf"),
-                    "centering_estimated_centers": str(paths["centering"] / "estimated_centers.pdf")}
+                **({"centering_before_after": str(paths["centering"] / "before_after.pdf")}
                    if args.centering else {}),
                 "denoising_preview": str(paths["denoising"] / "denoising_preview.pdf"),
                 "selection_diagnostic": str(paths["selection"] / "selection_diagnostic.pdf"),
@@ -1690,8 +1534,6 @@ def _denoise_parse_args(argv=None):
     args = parser.parse_args(argv)
     args.n_images = 0
     _resolve_particles_argument(parser, args)
-    _resolve_centering_arguments(parser, args)
-    del args.centering
     try:
         FastCWFDenoiseConfig(
             dataset_label=args.dataset_label,
@@ -1710,13 +1552,8 @@ def _denoise_parse_args(argv=None):
             eps=args.eps,
             ctf_mean_defocus_bin=args.ctf_mean_defocus_bin,
             flip_sign=args.flip_sign,
-            centering_radius=args.centering_radius,
-            centering_max_shift=args.centering_max_shift,
-            centering_individual=args.centering_individual,
-            centering_ctf_mode=args.centering_ctf_mode,
-            centering_wiener_balance=args.centering_wiener_balance,
+            centering=args.centering,
             centering_output_dir=args.centering_output_dir,
-            centering_max_distance_fraction=args.centering_max_distance_fraction,
         )
     except (TypeError, ValueError) as error:
         parser.error(str(error))
@@ -1743,13 +1580,8 @@ def denoise_main(argv=None):
             eps=args.eps,
             ctf_mean_defocus_bin=args.ctf_mean_defocus_bin,
             flip_sign=args.flip_sign,
-            centering_radius=args.centering_radius,
-            centering_max_shift=args.centering_max_shift,
-            centering_individual=args.centering_individual,
-            centering_ctf_mode=args.centering_ctf_mode,
-            centering_wiener_balance=args.centering_wiener_balance,
+            centering=args.centering,
             centering_output_dir=args.centering_output_dir,
-            centering_max_distance_fraction=args.centering_max_distance_fraction,
             driver_path=Path(__file__),
         )
     )
@@ -2770,14 +2602,7 @@ def _reconstruct_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", choices=("cpu", "gpu"), default="gpu")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--print-every", type=int, default=100)
-    parser.add_argument(
-        "--shift-step-px", type=float, default=None,
-        help=("model the per-image shifts that remain after the common-shift correction by an isotropic radial distribution on rings "
-              "spaced by this many moment-grid pixels (sub-pixel allowed), fitted jointly with the volume and the viewing density "
-              "in the M3 stage; off by default (see kam.shift_distribution)"))
-    parser.add_argument(
-        "--shift-max-px", type=float, default=5.0,
-        help="largest ring radius in moment-grid pixels (used with --shift-step-px)")
+    _add_shift_arguments(parser)
     parser.add_argument(
         "--resume", action="store_true",
         help="resume compatible partial outputs; otherwise output must be empty",
@@ -2785,11 +2610,34 @@ def _reconstruct_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _check_shift_settings(output_dir: Path, args: argparse.Namespace) -> None:
+def _add_shift_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--shift-distribution", action=argparse.BooleanOptionalAction, default=True,
+        help=("model the per-image shifts that remain after the common-shift correction by an isotropic radial distribution on rings, "
+              "fitted jointly with the volume and the viewing density in the M3 stage (see kam.shift_distribution); "
+              "enabled by default"))
+    parser.add_argument(
+        "--shift-step-px", type=float, default=0.25,
+        help="spacing of the shift rings in moment-grid pixels (sub-pixel allowed)")
+    parser.add_argument(
+        "--shift-max-px", type=float, default=None,
+        help=("largest ring radius in moment-grid pixels (default: a quarter of the radius of the "
+              "downsampled moment images, i.e. side / 8)"))
+
+
+def _shift_settings(args: argparse.Namespace, prepared_dir: Path) -> dict | None:
+    """Ring grid of the shift distribution, or None when it is switched off."""
+    if not args.shift_distribution:
+        return None
+    with np.load(Path(prepared_dir) / "moments.npz") as saved:
+        side = int(saved["ds_res"])
+    max_px = side / 8 if args.shift_max_px is None else args.shift_max_px
+    return dict(step_px=args.shift_step_px, max_px=max_px)
+
+
+def _check_shift_settings(output_dir: Path, wanted: dict | None) -> None:
     """Never resume (or mix) outputs fitted with a different shift-distribution setting."""
     path = output_dir / "shift_distribution_settings.json"
-    wanted = (None if args.shift_step_px is None
-              else dict(step_px=args.shift_step_px, max_px=args.shift_max_px))
     saved = json.loads(path.read_text()) if path.is_file() else None
     if saved != wanted and (saved is not None or (output_dir / "M3").exists()):
         raise ValueError(
@@ -2811,7 +2659,8 @@ def reconstruct_prepared_main(argv: list[str] | None = None) -> int:
         raise FileExistsError(
             f"{output_dir} is nonempty; choose a new directory or use --resume")
     output_dir.mkdir(parents=True, exist_ok=True)
-    _check_shift_settings(output_dir, args)
+    shift = _shift_settings(args, prepared_dir)
+    _check_shift_settings(output_dir, shift)
     m1_dir = output_dir / "M1"
     m2_dir = output_dir / "M2"
     m3_dir = output_dir / "M3"
@@ -2847,11 +2696,11 @@ def reconstruct_prepared_main(argv: list[str] | None = None) -> int:
     m2_result = reconstruct_single_moment(m2_config)
     m2_wall = time.monotonic() - m2_started
     m3_started = time.monotonic()
-    if args.shift_step_px is None:
+    if shift is None:
         m3_result = reconstruct_single_moment(m3_config)
     else:
         from . import shift_distribution
-        with shift_distribution.shift_law(args.shift_step_px, args.shift_max_px) as law:
+        with shift_distribution.shift_law(shift["step_px"], shift["max_px"]) as law:
             m3_result = reconstruct_single_moment(m3_config)
         shift_distribution.write_records(law, m3_dir / "shift_distribution.json")
     m3_wall = time.monotonic() - m3_started
