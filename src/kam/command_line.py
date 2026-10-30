@@ -2771,10 +2771,31 @@ def _reconstruct_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--print-every", type=int, default=100)
     parser.add_argument(
+        "--shift-step-px", type=float, default=None,
+        help=("model the per-image shifts that remain after the common-shift correction by an isotropic radial distribution on rings "
+              "spaced by this many moment-grid pixels (sub-pixel allowed), fitted jointly with the volume and the viewing density "
+              "in the M3 stage; off by default (see kam.shift_distribution)"))
+    parser.add_argument(
+        "--shift-max-px", type=float, default=5.0,
+        help="largest ring radius in moment-grid pixels (used with --shift-step-px)")
+    parser.add_argument(
         "--resume", action="store_true",
         help="resume compatible partial outputs; otherwise output must be empty",
     )
     return parser
+
+
+def _check_shift_settings(output_dir: Path, args: argparse.Namespace) -> None:
+    """Never resume (or mix) outputs fitted with a different shift-distribution setting."""
+    path = output_dir / "shift_distribution_settings.json"
+    wanted = (None if args.shift_step_px is None
+              else dict(step_px=args.shift_step_px, max_px=args.shift_max_px))
+    saved = json.loads(path.read_text()) if path.is_file() else None
+    if saved != wanted and (saved is not None or (output_dir / "M3").exists()):
+        raise ValueError(
+            f"{output_dir} was produced with shift setting {saved}, not {wanted}; use a new output directory")
+    if wanted is not None and saved is None:
+        path.write_text(json.dumps(wanted) + "\n")
 
 
 def reconstruct_prepared_main(argv: list[str] | None = None) -> int:
@@ -2790,6 +2811,7 @@ def reconstruct_prepared_main(argv: list[str] | None = None) -> int:
         raise FileExistsError(
             f"{output_dir} is nonempty; choose a new directory or use --resume")
     output_dir.mkdir(parents=True, exist_ok=True)
+    _check_shift_settings(output_dir, args)
     m1_dir = output_dir / "M1"
     m2_dir = output_dir / "M2"
     m3_dir = output_dir / "M3"
@@ -2825,7 +2847,13 @@ def reconstruct_prepared_main(argv: list[str] | None = None) -> int:
     m2_result = reconstruct_single_moment(m2_config)
     m2_wall = time.monotonic() - m2_started
     m3_started = time.monotonic()
-    m3_result = reconstruct_single_moment(m3_config)
+    if args.shift_step_px is None:
+        m3_result = reconstruct_single_moment(m3_config)
+    else:
+        from . import shift_distribution
+        with shift_distribution.shift_law(args.shift_step_px, args.shift_max_px) as law:
+            m3_result = reconstruct_single_moment(m3_config)
+        shift_distribution.write_records(law, m3_dir / "shift_distribution.json")
     m3_wall = time.monotonic() - m3_started
     total = time.monotonic() - started
 
