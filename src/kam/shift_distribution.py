@@ -68,6 +68,7 @@ class ShiftRings:
                         radial[abs(q)].T @ (J[:, None] * radial[abs(p)]))
         self.K = torch.tensor(K, dtype=torch.float64, device=self.device)
         self._m3_maps()
+        self._flat_maps()
 
     # ---- stored <-> signed full tensors ---------------------------------- #
     def _m3_maps(self):
@@ -86,20 +87,45 @@ class ShiftRings:
     def _grid(ix):
         return ix[0][:, None, None], ix[1][None, :, None], ix[2][None, None, :]
 
+    def _flat_maps(self):
+        """Flat gather maps: the signed tensor is ``X[tgt] = vals[src]`` with ``vals = [coef * m3, conj(coef * m3)]`` and the stored
+        entries are read back as ``rd_w * Y[rd_idx]``. Later writes win exactly as in sequential assignment."""
+        torch, n = self.torch, self.n
+        flat = lambda ix: ((ix[0][:, None, None] * n + ix[1][None, :, None]) * n + ix[2][None, None, :])
+        total = sum(int(np.prod(b[5])) for b in self.m3)
+        tgt, src, rd_idx, rd_w, coef = [], [], [], [], []
+        perms = ((0, 1, 2), (0, 2, 1), (1, 0, 2), (1, 2, 0), (2, 0, 1), (2, 1, 0))
+        for sl, sw, sign, ax, rf, shape in self.m3:
+            ax, rf = [a.cpu().numpy() for a in ax], [a.cpu().numpy() for a in rf]
+            local = np.arange(sl.start, sl.stop).reshape(shape)
+            for perm in perms:
+                tgt.append(flat([ax[t] for t in perm]).ravel())
+                src.append(local.transpose(perm).ravel())
+                tgt.append(flat([rf[t] for t in perm]).ravel())
+                src.append(local.transpose(perm).ravel() + total)
+            rd_idx.append(flat(ax).ravel())
+            rd_w.append(np.full(int(np.prod(shape)), sw * sign))
+            coef.append(np.full(int(np.prod(shape)), sign / sw))
+        tgt, src = np.concatenate(tgt), np.concatenate(src)
+        _, first = np.unique(tgt[::-1], return_index=True)
+        keep = len(tgt) - 1 - first
+        dev = self.device
+        self._tgt = torch.as_tensor(tgt[keep], dtype=torch.long, device=dev)
+        self._src = torch.as_tensor(src[keep], dtype=torch.long, device=dev)
+        self._rd_idx = torch.as_tensor(np.concatenate(rd_idx), dtype=torch.long, device=dev)
+        self._rd_w = torch.as_tensor(np.concatenate(rd_w), dtype=torch.float64, device=dev)
+        self._coef = torch.as_tensor(np.concatenate(coef), dtype=torch.float64, device=dev)
+
     def _full3(self, m3):
         torch = self.torch
-        X = torch.zeros((self.n,) * 3, dtype=torch.complex128, device=self.device)
-        for sl, sw, sign, ax, rf, shape in self.m3:
-            blk = (sign / sw) * m3[sl].reshape(shape)
-            for perm in ((0, 1, 2), (0, 2, 1), (1, 0, 2), (1, 2, 0), (2, 0, 1), (2, 1, 0)):
-                X = X.index_put(self._grid([ax[t] for t in perm]), blk.permute(*perm))
-                X = X.index_put(self._grid([rf[t] for t in perm]), torch.conj(blk).permute(*perm))
-        return X
+        v = self._coef * m3
+        X = torch.zeros(self.n ** 3, dtype=torch.complex128, device=self.device)
+        X = X.index_put((self._tgt,), torch.cat([v, torch.conj(v)])[self._src])
+        return X.reshape((self.n,) * 3)
 
     def _read3(self, Y):
-        torch = self.torch
-        return torch.cat([(sw * sign * Y[self._grid(ax)]).reshape(-1)
-                          for sl, sw, sign, ax, rf, shape in self.m3])
+        """Stored M3 entries of every ring: ``Y`` has shape (rings, n, n, n)."""
+        return Y.reshape(Y.shape[0], -1)[:, self._rd_idx] * self._rd_w
 
     # ---- operators --------------------------------------------------------- #
     def apply(self, order, m0):
@@ -122,22 +148,37 @@ class ShiftRings:
                 out.append((np.sqrt(blk["weight"]) * acc).reshape(self.m, -1))
             return torch.cat(out, dim=1)
         if order == 3:
-            Y = torch.einsum("jia,jkb,jlc,abc->jikl", K, K, K, self._full3(m0))
-            return torch.stack([self._read3(Y[j]) for j in range(self.m)])
+            Y = torch.einsum("jia,abc->jibc", K, self._full3(m0))
+            Y = torch.einsum("jkb,jibc->jikc", K, Y)
+            Y = torch.einsum("jlc,jikc->jikl", K, Y)
+            return self._read3(Y)
         raise ValueError(f"unsupported moment order {order}")
 
-    def predict(self, order, m0, d):
-        """``d @ F`` for numpy ``m0`` and ``d``; also returns ``F`` as numpy."""
+    def predict(self, order, m0, d, keep_graph=False):
+        """``d @ F`` for numpy ``m0`` and ``d``; also returns ``F`` as numpy. With ``keep_graph`` the autograd graph is kept so the following
+        :meth:`pullback` of the same ``m0`` object does not repeat the forward pass."""
         torch = self.torch
-        F = self.apply(order, torch.tensor(np.asarray(m0), dtype=torch.complex128, device=self.device))
-        y = torch.tensor(np.asarray(d), dtype=torch.complex128, device=self.device) @ F
-        return y.cpu().numpy(), F.cpu().numpy()
+        self._graph = None
+        if keep_graph:
+            mr = torch.tensor(np.stack([m0.real, m0.imag], -1), dtype=torch.float64, device=self.device, requires_grad=True)
+            F = self.apply(order, torch.view_as_complex(mr))
+            self._graph = (m0, order, mr, F)
+        else:
+            F = self.apply(order, torch.tensor(np.asarray(m0), dtype=torch.complex128, device=self.device))
+        y = torch.tensor(np.asarray(d), dtype=torch.complex128, device=self.device) @ F.detach()
+        return y.cpu().numpy(), F.detach().cpu().numpy()
 
     def pullback(self, order, m0, d, clean):
         """Adjoint for the real inner product: gradient of ``sum <clean, d @ F(m0)>`` (real and imaginary parts) with respect to ``m0``."""
         torch = self.torch
-        mr = torch.tensor(np.stack([m0.real, m0.imag], -1), dtype=torch.float64, device=self.device, requires_grad=True)
-        y = torch.tensor(np.asarray(d), dtype=torch.complex128, device=self.device) @ self.apply(order, torch.view_as_complex(mr))
+        graph = getattr(self, "_graph", None)
+        if graph is not None and graph[0] is m0 and graph[1] == order:
+            _, _, mr, F = graph
+            self._graph = None
+        else:
+            mr = torch.tensor(np.stack([m0.real, m0.imag], -1), dtype=torch.float64, device=self.device, requires_grad=True)
+            F = self.apply(order, torch.view_as_complex(mr))
+        y = torch.tensor(np.asarray(d), dtype=torch.complex128, device=self.device) @ F
         c = torch.tensor(np.asarray(clean), dtype=torch.complex128, device=self.device)
         (g,) = torch.autograd.grad((torch.view_as_real(y) * torch.view_as_real(c)).sum(), mr)
         return (g[..., 0] + 1j * g[..., 1]).detach().cpu().numpy()
@@ -170,7 +211,7 @@ def shift_law(step_px=DEFAULT_STEP_PX, max_px=DEFAULT_MAX_PX):
         out = list(orig_moments(self, C, w, orders=orders, batch_size=batch_size))
         if law.active and out[2] is not None:
             law.m0 = out[2]
-            out[2], law.F = law.rings.predict(3, out[2], law.d)
+            out[2], law.F = law.rings.predict(3, out[2], law.d, keep_graph=True)
         return tuple(out)
 
     def gradients(self, C, w, clean):
