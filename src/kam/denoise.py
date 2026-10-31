@@ -83,7 +83,7 @@ class FastCWFDenoiseConfig:
     device: str = "gpu"
     background_radius: float = 0.9
     eps: float = 1e-3
-    max_order: int | None = None
+    denoise_max_order: int | None = None
     ctf_mean_defocus_bin: float = 50.0
     flip_sign: bool = True
     fast_pca_root: Path = DEFAULT_FAST_PCA_ROOT
@@ -123,8 +123,8 @@ class FastCWFDenoiseConfig:
             raise ValueError("background_radius must be between 0 and sqrt(2)")
         if not np.isfinite(self.eps) or not 0 < self.eps < 1:
             raise ValueError("eps must be between 0 and 1")
-        if self.max_order is not None and (int(self.max_order) != self.max_order or self.max_order < 1):
-            raise ValueError("max_order must be a positive integer or None")
+        if self.denoise_max_order is not None and (int(self.denoise_max_order) != self.denoise_max_order or self.denoise_max_order < 1):
+            raise ValueError("denoise_max_order must be a positive integer or None")
         if (isinstance(self.ctf_mean_defocus_bin, (bool, np.bool_))
                 or not np.isfinite(self.ctf_mean_defocus_bin)
                 or self.ctf_mean_defocus_bin < 0):
@@ -707,7 +707,7 @@ def denoise_relion_particles(config: FastCWFDenoiseConfig) -> FastCWFDenoiseResu
     if args.device == "gpu":
         GPUFLEBasis2D, estimate_radial_psd_gpu = _gpu_fle_components()
 
-        basis = _with_max_order(GPUFLEBasis2D, args.max_order)(
+        basis = _with_max_order(GPUFLEBasis2D, args.denoise_max_order)(
             args.denoise_res, args.denoise_res, eps=args.eps,
             precision="single")
         def psd_estimator(images):
@@ -716,7 +716,7 @@ def denoise_relion_particles(config: FastCWFDenoiseConfig) -> FastCWFDenoiseResu
 
         fastpca_backend = "cupy_cufinufft_fle"
     else:
-        basis = _with_max_order(FLEBasis2D, args.max_order)(
+        basis = _with_max_order(FLEBasis2D, args.denoise_max_order)(
             args.denoise_res, args.denoise_res, eps=args.eps,
             precision="single")
         def psd_estimator(images):
@@ -1117,7 +1117,7 @@ def denoise_relion_particles(config: FastCWFDenoiseConfig) -> FastCWFDenoiseResu
         "device": args.device,
         "fastpca_backend": fastpca_backend,
         "fle_precision": basis.precision,
-        "fle_max_order": None if args.max_order is None else int(args.max_order),
+        "fle_max_order": None if args.denoise_max_order is None else int(args.denoise_max_order),
         "fle_n_coefficients": int(np.sum(basis.blk_size)),
         "n_images": n_images,
         "n_total": particles.n,
