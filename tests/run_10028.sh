@@ -40,6 +40,7 @@ kam pipeline /home/yw3384/datasets/EMPIAR-10028/shiny_2sets_fixed.star \
   --outdir "$RESULTS" \
   --n-select 10000 \
   --denoise-res 64 \
+  --denoise-max-order 40 \
   --do-global-centering \
   --vol-degree 7 \
   --viewing-degree 2 \

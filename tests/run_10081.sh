@@ -40,6 +40,7 @@ kam pipeline /scratch/gpfs/CRYOEM/gilleslab/mg6942/em_fixtures/empiar_10081_hcn1
   --outdir "$RESULTS" \
   --n-select 10000 \
   --denoise-res 64 \
+  --denoise-max-order 40 \
   --do-global-centering \
   --vol-degree 7 \
   --viewing-degree 2 \

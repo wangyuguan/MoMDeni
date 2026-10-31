@@ -42,6 +42,7 @@ kam pipeline /tigress/CRYOEM/singerlab/EMPIAR11028/processed_particles.star \
   --outdir "$RESULTS" \
   --n-select 10000 \
   --denoise-res 64 \
+  --denoise-max-order 40 \
   --do-global-centering \
   --vol-degree 7 \
   --viewing-degree 2 \

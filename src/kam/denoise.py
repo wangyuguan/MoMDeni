@@ -83,6 +83,7 @@ class FastCWFDenoiseConfig:
     device: str = "gpu"
     background_radius: float = 0.9
     eps: float = 1e-3
+    max_order: int | None = None
     ctf_mean_defocus_bin: float = 50.0
     flip_sign: bool = True
     fast_pca_root: Path = DEFAULT_FAST_PCA_ROOT
@@ -122,6 +123,8 @@ class FastCWFDenoiseConfig:
             raise ValueError("background_radius must be between 0 and sqrt(2)")
         if not np.isfinite(self.eps) or not 0 < self.eps < 1:
             raise ValueError("eps must be between 0 and 1")
+        if self.max_order is not None and (int(self.max_order) != self.max_order or self.max_order < 1):
+            raise ValueError("max_order must be a positive integer or None")
         if (isinstance(self.ctf_mean_defocus_bin, (bool, np.bool_))
                 or not np.isfinite(self.ctf_mean_defocus_bin)
                 or self.ctf_mean_defocus_bin < 0):
@@ -368,6 +371,22 @@ def verify_fastpca_order(results, starts, counts):
     np.testing.assert_array_equal(
         results["image_indices_list"], np.r_[0, np.cumsum(counts)]
     )
+
+
+def _with_max_order(basis_class, max_order):
+    """FLE basis class that keeps only the eigenfunctions of angular order ``|nu| <= max_order`` (all of them if ``None``).
+
+    Conjugate pairs +-nu stay together and FastPCA's mean, covariance and Wiener filter then run on the smaller basis."""
+    if max_order is None:
+        return basis_class
+
+    class MaxOrderBasis(basis_class):
+        def lap_eig_disk(self, *args, **kwargs):
+            psi, ns, ks, lmds, cs, _ = super().lap_eig_disk(*args, **kwargs)
+            keep = np.abs(ns) <= max_order
+            return ([f for f, k in zip(psi, keep) if k], ns[keep], ks[keep], lmds[keep], cs[keep], int(keep.sum()))
+
+    return MaxOrderBasis
 
 
 def denoise_fastpca_batches(fast_pca, mean_est, covar_est, batch_size):
@@ -688,7 +707,7 @@ def denoise_relion_particles(config: FastCWFDenoiseConfig) -> FastCWFDenoiseResu
     if args.device == "gpu":
         GPUFLEBasis2D, estimate_radial_psd_gpu = _gpu_fle_components()
 
-        basis = GPUFLEBasis2D(
+        basis = _with_max_order(GPUFLEBasis2D, args.max_order)(
             args.denoise_res, args.denoise_res, eps=args.eps,
             precision="single")
         def psd_estimator(images):
@@ -697,7 +716,7 @@ def denoise_relion_particles(config: FastCWFDenoiseConfig) -> FastCWFDenoiseResu
 
         fastpca_backend = "cupy_cufinufft_fle"
     else:
-        basis = FLEBasis2D(
+        basis = _with_max_order(FLEBasis2D, args.max_order)(
             args.denoise_res, args.denoise_res, eps=args.eps,
             precision="single")
         def psd_estimator(images):
@@ -1098,6 +1117,8 @@ def denoise_relion_particles(config: FastCWFDenoiseConfig) -> FastCWFDenoiseResu
         "device": args.device,
         "fastpca_backend": fastpca_backend,
         "fle_precision": basis.precision,
+        "fle_max_order": None if args.max_order is None else int(args.max_order),
+        "fle_n_coefficients": int(np.sum(basis.blk_size)),
         "n_images": n_images,
         "n_total": particles.n,
         "seed": args.seed,

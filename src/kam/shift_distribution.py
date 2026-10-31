@@ -15,7 +15,8 @@ acting on the signed coefficient tensors of the unshifted moments x_k(A, B), so 
     y_k = sum_j d_j S_{k,j} x_k(A, B).
 
 The weights d are fitted jointly with the volume and the viewing density by one L-BFGS-B run, d = u / sum(u) with u >= 0 (box constraints keep
-d on the simplex exactly; u = e_0 is "no shift"). Only the M3 stage uses the shift law. `shift_law` temporarily wraps the moment evaluation and
+d on the simplex exactly; u = e_0 is "no shift"). Every stage (M1, M2, M3) fits its own d; a stage starts from the d of the same
+initialization in the previous stage. `shift_law` temporarily wraps the moment evaluation and
 the single-moment fit, so none of the reconstruction modules that define the implementation fingerprint is modified.
 """
 import contextlib
@@ -69,6 +70,7 @@ class ShiftRings:
         self.K = torch.tensor(K, dtype=torch.float64, device=self.device)
         self._m3_maps()
         self._flat_maps()
+        self._m2_maps()
 
     # ---- stored <-> signed full tensors ---------------------------------- #
     def _m3_maps(self):
@@ -127,6 +129,35 @@ class ShiftRings:
         """Stored M3 entries of every ring: ``Y`` has shape (rings, n, n, n)."""
         return Y.reshape(Y.shape[0], -1)[:, self._rd_idx] * self._rd_w
 
+    def _m2_maps(self):
+        """Zero-padded layout of the M2 operator: ``acc[j,q] = sum_p K[j,q,p] M_p K[j,q,p]^T`` for every q >= 0 and signed p in one einsum."""
+        torch, Tm = self.torch, max(self.T)
+        blocks = self.basis.m2_blocks
+        n_stored = sum(int(b["slice"].stop - b["slice"].start) for b in blocks)
+        src = np.full((len(self.orders), Tm, Tm), n_stored, dtype=np.int64)
+        scale = np.zeros((len(self.orders), Tm, Tm))
+        Kpad = np.zeros((self.m, self.L + 1, len(self.orders), Tm, Tm))
+        K = self.K.cpu().numpy()
+        for ip, p in enumerate(self.orders):
+            pb, t = blocks[abs(p)], self.T[abs(p)]
+            idx = np.arange(pb["slice"].start, pb["slice"].stop).reshape(t, t)
+            src[ip, :t, :t] = idx if p >= 0 else idx.T
+            scale[ip, :t, :t] = 1.0 / np.sqrt(pb["weight"])
+            for q in range(self.L + 1):
+                Kpad[:, q, ip, :self.T[q], :t] = K[:, self.off[q][0]:self.off[q][1], self.off[p][0]:self.off[p][1]]
+        read, w = [], []
+        for q, blk in enumerate(blocks):
+            t = self.T[q]
+            rows = (q * Tm + np.arange(t)[:, None]) * Tm + np.arange(t)[None, :]
+            read.append(rows.ravel())
+            w.append(np.full(t * t, np.sqrt(blk["weight"])))
+        dev = self.device
+        self._m2_src = torch.as_tensor(src, device=dev)
+        self._m2_scale = torch.as_tensor(scale, dtype=torch.complex128, device=dev)
+        self._Kpad = torch.as_tensor(Kpad, dtype=torch.complex128, device=dev)
+        self._m2_read = torch.as_tensor(np.concatenate(read), dtype=torch.long, device=dev)
+        self._m2_w = torch.as_tensor(np.concatenate(w), dtype=torch.float64, device=dev)
+
     # ---- operators --------------------------------------------------------- #
     def apply(self, order, m0):
         """``F[j]``: the ring-j moment of the flat stored moment ``m0`` (complex tensor on ``self.device``)."""
@@ -136,17 +167,9 @@ class ShiftRings:
             s0 = slice(*self.off[0])
             return torch.einsum("jab,b->ja", K[:, s0, s0], m0)
         if order == 2:
-            out = []
-            for blk in self.basis.m2_blocks:
-                sq, acc = slice(*self.off[blk["q"]]), 0
-                for p in self.orders:
-                    pb = self.basis.m2_blocks[abs(p)]
-                    M = m0[pb["slice"]].reshape(self.T[abs(p)], self.T[abs(p)]) / np.sqrt(pb["weight"])
-                    M = M if p >= 0 else M.T
-                    Kq = K[:, sq, slice(*self.off[p])]
-                    acc = acc + torch.einsum("jab,bc,jdc->jad", Kq, M, Kq)
-                out.append((np.sqrt(blk["weight"]) * acc).reshape(self.m, -1))
-            return torch.cat(out, dim=1)
+            mp = torch.cat([m0, m0.new_zeros(1)])[self._m2_src] * self._m2_scale          # (orders, Tmax, Tmax), zero padded
+            acc = torch.einsum("jqpab,pbc,jqpdc->jqad", self._Kpad, mp, self._Kpad)
+            return acc.reshape(self.m, -1)[:, self._m2_read] * self._m2_w
         if order == 3:
             Y = torch.einsum("jia,abc->jibc", K, self._full3(m0))
             Y = torch.einsum("jkb,jibc->jikc", K, Y)
@@ -187,8 +210,11 @@ class ShiftRings:
 class _Law:
     """State shared by the wrapped moment functions and the joint fit."""
 
-    def __init__(self, step_px, max_px):
+    def __init__(self, step_px, max_px, warm=None):
         self.rho_px = ring_radii(step_px, max_px)
+        self.warm = [np.asarray(w, float) for w in (warm or [])]
+        self.calls = 0
+        self.order = 3
         self.rings = None
         self.active = False
         self.d = None
@@ -198,35 +224,37 @@ class _Law:
 
 
 @contextlib.contextmanager
-def shift_law(step_px=DEFAULT_STEP_PX, max_px=DEFAULT_MAX_PX):
-    """Fit the shift law jointly with volume and viewing density in the M3 stage while the context is open.
+def shift_law(step_px=DEFAULT_STEP_PX, max_px=DEFAULT_MAX_PX, warm=None):
+    """Fit the shift law jointly with volume and viewing density in the single-moment fit of the open context (any of M1, M2, M3).
 
-    Yields the state object; its ``records`` list has one entry per initialization (ring radii in pixels, fitted weights, losses)."""
-    law = _Law(step_px, max_px)
+    ``warm`` is the ``records`` list of the previous stage; initialization i starts from its fitted weights. Yields the state object; its
+    ``records`` list has one entry per initialization (ring radii in pixels, fitted weights, losses)."""
+    law = _Law(step_px, max_px, warm)
     FB = _moments_module.FBMomentBasis
     orig_moments, orig_gradients = FB.moments, FB.moment_gradients
     orig_fit = _postprocessing.fit_single_moment_low_degree
 
     def moments(self, C, w, orders=(1, 2, 3), batch_size=4096):
         out = list(orig_moments(self, C, w, orders=orders, batch_size=batch_size))
-        if law.active and out[2] is not None:
-            law.m0 = out[2]
-            out[2], law.F = law.rings.predict(3, out[2], law.d, keep_graph=True)
+        k = law.order - 1
+        if law.active and out[k] is not None:
+            law.m0 = out[k]
+            out[k], law.F = law.rings.predict(law.order, out[k], law.d, keep_graph=True)
         return tuple(out)
 
     def gradients(self, C, w, clean):
-        if law.active and clean[2] is not None:
+        k = law.order - 1
+        if law.active and clean[k] is not None:
             clean = list(clean)
-            clean[2] = law.rings.pullback(3, law.m0, law.d, clean[2])
+            clean[k] = law.rings.pullback(law.order, law.m0, law.d, clean[k])
         return orig_gradients(self, C, w, clean)
 
     def fit(param, grid, targets, lambdas, *args, **kwargs):
         weights, order = _viewing._single_order_weights(tuple(targets), lambdas)
-        if order != 3:
-            return orig_fit(param, grid, targets, lambdas, *args, **kwargs)
+        law.order = order
         bound = inspect.signature(orig_fit).bind(param, grid, targets, lambdas, *args, **kwargs)
         bound.apply_defaults()
-        result = _joint_fit(law, orig_fit, param, grid, targets, lambdas, weights[2], bound.arguments)
+        result = _joint_fit(law, orig_fit, param, grid, targets, lambdas, weights[order - 1], bound.arguments)
         law.active = False
         return result
 
@@ -246,7 +274,8 @@ def _joint_fit(law, orig_fit, param, grid, targets, lambdas, weight, arguments, 
     refl = bool(arguments.get("reflection_augmented", False))
     degree, maxiter = arguments.get("degree", 2), int(arguments.get("maxiter", 5000))
     weights = _viewing._single_order_weights(tuple(targets), lambdas)[0]
-    w3 = np.broadcast_to(np.asarray(weight, float), np.shape(targets[2]))
+    order = law.order
+    w3 = np.broadcast_to(np.asarray(weight, float), np.shape(targets[order - 1]))
     if law.rings is None:
         law.rings = ShiftRings(param.fb_basis, law.rho_px)
     M, nt = len(law.rho_px), param.n_params
@@ -259,6 +288,9 @@ def _joint_fit(law, orig_fit, param, grid, targets, lambdas, weight, arguments, 
     nb = len(b0)
     u0 = np.zeros(M)
     u0[0] = 1.0
+    if law.calls < len(law.warm) and len(law.warm[law.calls]) == M:
+        u0 = np.maximum(law.warm[law.calls], 0.0)
+    law.calls += 1
     x0 = np.r_[np.asarray(arguments["theta0"], float), b0, u0]
     scales = np.ones(3)
 
@@ -269,7 +301,7 @@ def _joint_fit(law, orig_fit, param, grid, targets, lambdas, weight, arguments, 
         value, g_theta, g_p, info = joint_objective_and_grad(
             theta, density.pmf(beta), param, grid, *targets, lambdas=weights, contrast_scales=scales,
             return_info=True, reflection_augmented=refl)
-        r = np.asarray(info["masked_m3"]) - np.asarray(targets[2])
+        r = np.asarray(info[f"masked_m{order}"]) - np.asarray(targets[order - 1])
         F = law.F.real.astype(complex) if refl else law.F
         g_d = 2 * np.real(((w3 * np.conj(r))[None, :] * F).sum(1))
         return value, np.r_[g_theta, density.vjp(beta, g_p), (g_d - law.d @ g_d) / total]
@@ -279,7 +311,7 @@ def _joint_fit(law, orig_fit, param, grid, targets, lambdas, weight, arguments, 
     def callback(_):
         state["nit"] += 1
         if state["nit"] % int(arguments.get("print_every") or 0 or 10 ** 9) == 0:
-            log(f"    [m3 shift law] it={state['nit']:5d}")
+            log(f"    [m{order} shift law] it={state['nit']:5d}")
 
     result = minimize(objective, x0, jac=True, method="L-BFGS-B", callback=callback,
                       bounds=[(None, None)] * (nt + nb) + [(0.0, None)] * M,
@@ -290,9 +322,11 @@ def _joint_fit(law, orig_fit, param, grid, targets, lambdas, weight, arguments, 
     # same final evaluation as fit_single_moment_low_degree (the caller checks loss == rel_misfit**2)
     law.active, law.d = True, d
     _, _, _, info = joint_objective_and_grad(theta, p, param, grid, *targets, lambdas=weights, contrast_scales=scales, return_info=True)
-    norm = max(float(np.linalg.norm(np.ravel(targets[2]))), 1e-30)
+    norm = max(float(np.linalg.norm(np.ravel(targets[order - 1]))), 1e-30)
     stage = dict(template["stages"][0])
-    stage["rel_misfit"] = (float("nan"), float("nan"), float(info["misfit3"] / norm))
+    misfit = [float("nan")] * 3
+    misfit[order - 1] = float(info[f"misfit{order}"] / norm)
+    stage["rel_misfit"] = tuple(misfit)
     update = dict(theta=theta.copy(), beta=beta.copy(), p=p.copy(), res=result, status=int(result.status), nit=int(result.nit),
                   nfev=int(result.nfev), message=str(result.message), viewing_diagnostics=density.evaluate(beta))
     out = dict(template)
@@ -304,7 +338,7 @@ def _joint_fit(law, orig_fit, param, grid, targets, lambdas, weight, arguments, 
     law.records.append(dict(rho_px=law.rho_px.tolist(), d=d.tolist(), loss=float(result.fun), nit=int(result.nit),
                             mean_radius_px=float((d * law.rho_px).sum()),
                             rms_radius_px=float(np.sqrt((d * law.rho_px ** 2).sum()))))
-    log(f"  [m3 shift law] loss={result.fun:.6e} nit={result.nit} mean radius {law.records[-1]['mean_radius_px']:.3f} px, "
+    log(f"  [m{order} shift law] loss={result.fun:.6e} nit={result.nit} mean radius {law.records[-1]['mean_radius_px']:.3f} px, "
         f"rms {law.records[-1]['rms_radius_px']:.3f} px")
     return out
 
@@ -314,3 +348,12 @@ def write_records(law, path):
     with open(path, "w") as f:
         json.dump(dict(model="isotropic radial law on rings; d >= 0, sum d = 1", rho_px=law.rho_px.tolist(),
                        initializations=law.records), f, indent=2)
+
+
+def read_records(path):
+    """The ``initializations`` list written by :func:`write_records`, or an empty list if the file does not exist."""
+    try:
+        with open(path) as f:
+            return json.load(f)["initializations"]
+    except FileNotFoundError:
+        return []

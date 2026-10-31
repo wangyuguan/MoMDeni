@@ -269,6 +269,7 @@ def _configuration(args: argparse.Namespace) -> dict:
             "sampling": "all_STAR_rows",
             "seed": args.seed,
             "resolution": args.denoise_res,
+            "fle_max_order": args.denoise_max_order,
             "batch_size": args.batch_size,
             "device": args.device,
             "ctf_mean_defocus_bin_angstrom": args.ctf_mean_defocus_bin,
@@ -336,6 +337,7 @@ def _denoise_command(args, paths):
         "--batch-size", str(args.batch_size), "--workers", str(args.workers),
         "--device", args.device,
         "--background-radius", str(args.background_radius),
+        *(["--denoise-max-order", str(args.denoise_max_order)] if args.denoise_max_order is not None else []),
         "--ctf-mean-defocus-bin", str(args.ctf_mean_defocus_bin),
         "--flip-sign" if args.flip_sign else "--no-flip-sign",
         "--do-global-centering" if args.centering else "--no-do-global-centering",
@@ -553,6 +555,7 @@ def _denoising_complete(path: Path, args: argparse.Namespace) -> bool:
             or report.get("device") != args.device
             or report.get("fastpca_backend") != expected_backend
             or report.get("fle_precision") != "single"
+            or report.get("fle_max_order") != args.denoise_max_order
             or bool(report.get("flip_sign")) != args.flip_sign
             or int(report.get("n_images", -1)) != int(report.get("n_total", -2))
             or report.get("sampling") != "all_STAR_rows"
@@ -1129,11 +1132,10 @@ def _reconstruct(args: argparse.Namespace, paths: dict[str, Path],
              args.viewing_degree, args.sphere_nodes, args.sphere_degree,
              args.n_init, args.maxiter, initial_fit)
     print("[pipeline] " + description, flush=True)
-    if order == 3:
-        print("[pipeline] shift distribution: "
-              + ("off" if not args.shift_distribution else
-                 f"rings every {args.shift_step_px} px up to "
-                 f"{'side/8' if args.shift_max_px is None else args.shift_max_px} px"), flush=True)
+    print("[pipeline] shift distribution: "
+          + ("off" if not args.shift_distribution else
+             f"rings every {args.shift_step_px} px up to "
+             f"{'side/8' if args.shift_max_px is None else args.shift_max_px} px (M1, M2, M3)"), flush=True)
     if args.dry_run:
         return
     from .postprocessing import ReconstructionConfig, reconstruct_single_moment
@@ -1146,18 +1148,17 @@ def _reconstruct(args: argparse.Namespace, paths: dict[str, Path],
         seed=args.seed, resume=args.resume,
         initial_fit=initial_fit,
     )
-    shift = _shift_settings(args, paths["prepared"]) if order == 3 else None
-    if order != 3:
+    shift = _shift_settings(args, paths["prepared"])
+    _check_shift_settings(output.parent, shift)
+    if shift is None:
         reconstruct_single_moment(config)
     else:
-        _check_shift_settings(output.parent, shift)
-        if shift is None:
+        from . import shift_distribution
+        warm = (shift_distribution.read_records(paths[f"m{order - 1}"] / "shift_distribution.json")
+                if order > 1 else None)
+        with shift_distribution.shift_law(shift["step_px"], shift["max_px"], warm=[r["d"] for r in warm or []]) as law:
             reconstruct_single_moment(config)
-        else:
-            from . import shift_distribution
-            with shift_distribution.shift_law(shift["step_px"], shift["max_px"]) as law:
-                reconstruct_single_moment(config)
-            shift_distribution.write_records(law, output / "shift_distribution.json")
+        shift_distribution.write_records(law, output / "shift_distribution.json")
     if not _fit_complete(output, args, order):
         raise RuntimeError(f"M{order} reconstruction returned incomplete outputs")
 
@@ -1179,7 +1180,7 @@ def _add_centering_arguments(parser):
         help=("estimate a guarded shift common to the dataset and correct it before "
               "denoising, without RELION poses, shifts or reference maps; "
               "enabled by default. The remaining per-image shifts are not estimated: "
-              "they are modeled by the shift distribution in the M3 stage"))
+              "they are modeled by the shift distribution fitted in the M1, M2 and M3 stages"))
 
 
 
@@ -1205,6 +1206,9 @@ def _pipeline_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--denoise-res", type=int, default=DEFAULT_DENOISE_RES,
         help="side length used by FastPCA denoising")
+    parser.add_argument(
+        "--denoise-max-order", type=int, default=None,
+        help="largest angular order |nu| of the Fourier-Bessel basis in FastPCA/CWF denoising; by default every order the basis supports")
     _add_centering_arguments(parser)
     parser.add_argument(
         "--moment-res", type=int, default=DEFAULT_MOMENT_RES,
@@ -1297,6 +1301,8 @@ def _validate_args(parser: argparse.ArgumentParser,
         parser.error(str(error))
     if args.n_select < 1:
         parser.error("n-select must be positive")
+    if args.denoise_max_order is not None and args.denoise_max_order < 1:
+        parser.error("denoise-max-order must be positive")
     if args.n_preview < 1 or args.batch_size < 1 or args.workers < 1:
         parser.error("preview, batch, and worker counts must be positive")
     if (args.denoise_res < 4 or args.denoise_res % 2
@@ -1519,6 +1525,9 @@ def _denoise_parse_args(argv=None):
     parser.add_argument("--background-radius", type=float, default=0.9)
     parser.add_argument("--eps", type=float, default=1e-3)
     parser.add_argument(
+        "--denoise-max-order", type=int, default=None,
+        help="largest angular order |nu| of the Fourier-Bessel basis in FastPCA/CWF denoising; by default every order the basis supports")
+    parser.add_argument(
         "--ctf-mean-defocus-bin",
         type=float,
         default=50.0,
@@ -1550,6 +1559,7 @@ def _denoise_parse_args(argv=None):
             output_dir=args.output_dir,
             background_radius=args.background_radius,
             eps=args.eps,
+            max_order=args.denoise_max_order,
             ctf_mean_defocus_bin=args.ctf_mean_defocus_bin,
             flip_sign=args.flip_sign,
             centering=args.centering,
@@ -1578,6 +1588,7 @@ def denoise_main(argv=None):
             output_dir=args.output_dir,
             background_radius=args.background_radius,
             eps=args.eps,
+            max_order=args.denoise_max_order,
             ctf_mean_defocus_bin=args.ctf_mean_defocus_bin,
             flip_sign=args.flip_sign,
             centering=args.centering,
@@ -2614,7 +2625,7 @@ def _add_shift_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--shift-distribution", action=argparse.BooleanOptionalAction, default=True,
         help=("model the per-image shifts that remain after the common-shift correction by an isotropic radial distribution on rings, "
-              "fitted jointly with the volume and the viewing density in the M3 stage (see kam.shift_distribution); "
+              "fitted jointly with the volume and the viewing density in each of the M1, M2 and M3 stages (see kam.shift_distribution); "
               "enabled by default"))
     parser.add_argument(
         "--shift-step-px", type=float, default=0.25,
@@ -2632,14 +2643,14 @@ def _shift_settings(args: argparse.Namespace, prepared_dir: Path) -> dict | None
     with np.load(Path(prepared_dir) / "moments.npz") as saved:
         side = int(saved["ds_res"])
     max_px = side / 8 if args.shift_max_px is None else args.shift_max_px
-    return dict(step_px=args.shift_step_px, max_px=max_px)
+    return dict(step_px=args.shift_step_px, max_px=max_px, orders=[1, 2, 3])
 
 
 def _check_shift_settings(output_dir: Path, wanted: dict | None) -> None:
     """Never resume (or mix) outputs fitted with a different shift-distribution setting."""
     path = output_dir / "shift_distribution_settings.json"
     saved = json.loads(path.read_text()) if path.is_file() else None
-    if saved != wanted and (saved is not None or (output_dir / "M3").exists()):
+    if saved != wanted and (saved is not None or any((output_dir / f"M{k}").exists() for k in (1, 2, 3))):
         raise ValueError(
             f"{output_dir} was produced with shift setting {saved}, not {wanted}; use a new output directory")
     if wanted is not None and saved is None:
@@ -2689,21 +2700,21 @@ def reconstruct_prepared_main(argv: list[str] | None = None) -> int:
 
     started_utc = _utc_now()
     started = time.monotonic()
-    m1_started = time.monotonic()
-    m1_result = reconstruct_single_moment(m1_config)
-    m1_wall = time.monotonic() - m1_started
-    m2_started = time.monotonic()
-    m2_result = reconstruct_single_moment(m2_config)
-    m2_wall = time.monotonic() - m2_started
-    m3_started = time.monotonic()
-    if shift is None:
-        m3_result = reconstruct_single_moment(m3_config)
-    else:
-        from . import shift_distribution
-        with shift_distribution.shift_law(shift["step_px"], shift["max_px"]) as law:
-            m3_result = reconstruct_single_moment(m3_config)
-        shift_distribution.write_records(law, m3_dir / "shift_distribution.json")
-    m3_wall = time.monotonic() - m3_started
+    results, walls, warm = {}, {}, None
+    for order, config_k, directory in ((1, m1_config, m1_dir), (2, m2_config, m2_dir), (3, m3_config, m3_dir)):
+        stage_started = time.monotonic()
+        if shift is None:
+            results[order] = reconstruct_single_moment(config_k)
+        else:
+            from . import shift_distribution
+            with shift_distribution.shift_law(
+                    shift["step_px"], shift["max_px"], warm=[r["d"] for r in warm or []]) as law:
+                results[order] = reconstruct_single_moment(config_k)
+            shift_distribution.write_records(law, directory / "shift_distribution.json")
+            warm = law.records
+        walls[order] = time.monotonic() - stage_started
+    m1_result, m2_result, m3_result = results[1], results[2], results[3]
+    m1_wall, m2_wall, m3_wall = walls[1], walls[2], walls[3]
     total = time.monotonic() - started
 
     stages = {

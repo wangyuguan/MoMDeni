@@ -14,8 +14,8 @@
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --export=NONE
 #SBATCH --chdir=/home/yw3384/softwares/denoised_kam
-#SBATCH --output=/home/yw3384/softwares/denoised_kam/local/logs/kam11618_%j.out
-#SBATCH --error=/home/yw3384/softwares/denoised_kam/local/logs/kam11618_%j.err
+#SBATCH --output=/dev/null
+#SBATCH --error=/dev/null
 
 set -euo pipefail
 
@@ -40,6 +40,7 @@ kam pipeline /scratch/gpfs/CRYOEM/yw3384/EMPIAR-11618/data/particles/J43_particl
   --outdir "$RESULTS" \
   --n-select 10000 \
   --denoise-res 64 \
+  --denoise-max-order 40 \
   --do-global-centering \
   --vol-degree 7 \
   --viewing-degree 2 \
