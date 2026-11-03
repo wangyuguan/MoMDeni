@@ -251,7 +251,7 @@ def _centering_algorithm_configuration(args: argparse.Namespace) -> dict | None:
         return None
     from dataclasses import asdict
 
-    return asdict(CenteringConfig(contrast_sign=-1 if args.flip_sign else 1))
+    return asdict(CenteringConfig())
 
 
 def _configuration(args: argparse.Namespace) -> dict:
@@ -1177,8 +1177,8 @@ def _add_centering_arguments(parser):
     parser.add_argument(
         "--do-global-centering", dest="centering",
         action=argparse.BooleanOptionalAction, default=True,
-        help=("estimate a guarded shift common to the dataset and correct it before "
-              "denoising, without RELION poses, shifts or reference maps; "
+        help=("estimate a shift common to the dataset from the CTF-corrected mean image and "
+              "correct it before denoising, without RELION poses, shifts or reference maps; "
               "enabled by default. The remaining per-image shifts are not estimated: "
               "they are modeled by the shift distribution fitted in the M1, M2 and M3 stages"))
 

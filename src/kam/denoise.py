@@ -742,11 +742,9 @@ def denoise_relion_particles(config: FastCWFDenoiseConfig) -> FastCWFDenoiseResu
     centering_setup_seconds = 0.0
     centering_diagnostic = None
     centering_inference = None
-    centering_inference_psd = None
     if image_centering:
         from .centering import (CenteringConfig, apply_image_shifts,
-                               estimate_dataset_shifts,
-                               estimate_background_noise_psd)
+                               estimate_dataset_shifts)
 
         centering_output = (
             args.centering_output_dir.resolve()
@@ -770,17 +768,16 @@ def denoise_relion_particles(config: FastCWFDenoiseConfig) -> FastCWFDenoiseResu
         recentering.update({
             "ctf_for_estimator": "FastPCA radial binned mean-defocus; H(0)=-alpha",
             "ctf_wavelength_angstrom": "12.2643247/sqrt(voltage_kV*1e3+0.978466*voltage_kV**2)",
-            "estimator_contrast_sign": -1.0 if args.flip_sign else 1.0,
             "phase_flip_applied_to_observations": False,
             "observations_modified_only_by_translation": True,
-            "uncertain_estimate_displacement": "zero: the common correction is kept only when image splits and frequency bands agree",
+            "uncertain_estimate_displacement": "zero: the common correction is applied only when it is at least min_shift_pixels and inside the unambiguous range",
             "center_coordinates": "box center minus the applied common XY correction, reversed to YX; not a calibrated physical center",
             "boundary_condition": "periodic Fourier translation; no padding or cropping beyond downsampling",
             "stage": "after all raw images are downsampled; before production background subtraction, PSD and CWF",
         })
         centering_setup_seconds = time.monotonic() - centering_started
         print(
-            "Guarded common-shift centering; CTF/noise weighting changes estimator copies only; "
+            "Common-shift centering from the CTF-corrected mean image; CTF weighting changes estimator copies only; "
             "no STAR origins, angles, or reference map",
             flush=True,
         )
@@ -822,27 +819,14 @@ def denoise_relion_particles(config: FastCWFDenoiseConfig) -> FastCWFDenoiseResu
     if image_centering:
         centering_started = time.monotonic()
         centering_preview_before[:] = observations[:centering_preview_count]
-        centering_inference_psd, centering_radial_psd = estimate_background_noise_psd(
-            observations, background_radius=args.background_radius, batch_size=args.batch_size)
-        centering_config = CenteringConfig(contrast_sign=-1 if args.flip_sign else 1)
         centering_inference, centering_algorithm = estimate_dataset_shifts(
-            observations, centering_ctfs, centering_inference_psd,
-            ctf_indices=ctf_ids, config=centering_config)
+            observations, centering_ctfs, ctf_ids, config=CenteringConfig())
         applied_shifts_denoise = centering_inference["shifts_xy"]
         recentering["algorithm"] = centering_algorithm
-        recentering["inference_noise_psd"] = {
-            "method": "radial background masked periodogram on uncorrected raw observations",
-            "normalization": "E|FFT(noise)|^2 / image_side^2",
-            "background_radius": args.background_radius,
-            "minimum": float(centering_radial_psd.min()),
-            "median": float(np.median(centering_radial_psd)),
-            "maximum": float(centering_radial_psd.max()),
-            "used_for_CWF": False,
-            "CWF_noise_psd": "re-estimated independently with FLE after translation and background subtraction",
-        }
         print(
-            f"Centering common correction XY={centering_inference['common_shift_xy'].tolist()}; "
-            f"common guard={centering_algorithm['common'].get('guard_passed', False)}",
+            f"Centering common correction XY={centering_inference['common_shift_xy'].tolist()} "
+            f"(estimate {centering_algorithm['estimate_xy_pixels']}, "
+            f"not applied because: {centering_algorithm['not_applied_reason']})",
             flush=True)
         centering_seconds += time.monotonic() - centering_started
         for start in range(0, n_images, args.batch_size):
@@ -885,7 +869,6 @@ def denoise_relion_particles(config: FastCWFDenoiseConfig) -> FastCWFDenoiseResu
             centering_estimates_path,
             source_rows=source_rows, image_names=image_names,
             applied_shifts_xy_denoise_pixels=applied_shifts_denoise,
-            inference_noise_psd=centering_inference_psd,
             **centering_inference,
         )
         preview_centers = (
