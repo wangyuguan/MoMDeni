@@ -21,7 +21,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-gpu = ["cupy-cuda12x"]
+gpu = ["cupy-cuda12x", "cufinufft"]
 
 [project.scripts]
 kam = "kam.command_line:main"

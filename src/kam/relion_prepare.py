@@ -1,44 +1,27 @@
-"""Optional RELION preparation and Della refinement-job generation.
+"""RELION preparation (``kam relion_prepare``) and post-processing (``kam postprocess``) of a finished pipeline run.
 
-This experiment driver is intentionally kept outside ``src`` because its
-launcher contains site-specific Slurm, module, MPI, and GPU settings.  The
-core MoM package does not import it.
+The refinement launcher contains site-specific Slurm, module, MPI, and GPU settings (Della).
 """
 
 from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
-import hashlib
 import json
-import math
 import os
 from pathlib import Path
 import re
 import shlex
 import subprocess
-import sys
 import tempfile
 import textwrap
 import time
 
-ROOT = Path(__file__).resolve().parents[2]
-
 import mrcfile
 import numpy as np
-from scipy import fft, signal
 
 from .preprocessing import RelionParticles
-
-
-def _sha256(path) -> str:
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as stream:
-        for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
+from .utils import fourier_resample_real, sha256_file
 
 _OPTICS_COLUMNS = (
     "_rlnVoltage",
@@ -74,107 +57,22 @@ def _canonical_dataset(value):
     value = str(value).strip().upper()
     if value.isdigit():
         value = f"EMPIAR-{value}"
-    if not value.startswith("EMPIAR-") or not value[7:].isdigit():
-        raise ValueError("dataset must be an EMPIAR identifier, e.g. EMPIAR-10073")
     return value
 
 
-def _load_source(config_path, map_path, dataset, native_side, native_pixel):
-    requested_config_path = Path(config_path).resolve(strict=True)
-    map_path = Path(map_path).resolve(strict=True)
-    requested_config = json.loads(requested_config_path.read_text())
-    authoritative_path = requested_config_path
-    config = requested_config
-    completion_keys = ("fit_complete", "complete")
-    if (requested_config_path.name == "config.json"
-            and all(key not in requested_config for key in completion_keys)):
-        authoritative_path = requested_config_path.with_name(
-            "summary.json").resolve(strict=True)
-        config = json.loads(authoritative_path.read_text())
-        identity_keys = (
-            "dataset", "order", "moment_res", "native_side",
-            "native_pixel_size_angstrom", "pixel_size_angstrom",
-            "n_initializations",
-        )
-        missing_identity = [
-            key for key in identity_keys
-            if key not in requested_config or key not in config
-        ]
-        if missing_identity:
-            raise ValueError(
-                "config.json and summary.json lack shared source identity "
-                f"fields: {missing_identity}")
-        mismatched = {
-            key: (requested_config[key], config[key])
-            for key in requested_config.keys() & config.keys()
-            if requested_config[key] != config[key]
-        }
-        if mismatched:
-            raise ValueError(
-                "config.json disagrees with its completed summary.json: "
-                f"{mismatched}")
-    expected = {"order": 3, "native_side": native_side}
-    for key, value in expected.items():
-        if config.get(key) != value:
-            raise ValueError(
-                f"source config has {key}={config.get(key)!r}; expected {value!r}"
-            )
-    if _canonical_dataset(config.get("dataset", "")) != dataset:
-        raise ValueError("source config belongs to a different dataset")
-    for complete_key in completion_keys:
-        if config.get(complete_key) is not True:
-            raise ValueError(
-                f"source summary must report {complete_key}=true")
-    source_side = config.get("moment_res")
-    if (isinstance(source_side, bool) or not isinstance(source_side, int)
-            or source_side < 4 or source_side % 2):
-        raise ValueError(
-            "source summary moment_res must be an even integer of at least 4")
-    n_initializations = config.get("n_initializations")
-    if (isinstance(n_initializations, bool)
-            or not isinstance(n_initializations, int)
-            or n_initializations < 1):
-        raise ValueError(
-            "source summary n_initializations must be a positive integer")
-
-    config_native_pixel = float(config.get("native_pixel_size_angstrom", math.nan))
-    source_pixel = float(config.get("pixel_size_angstrom", math.nan))
-    if not math.isclose(config_native_pixel, native_pixel, rel_tol=2e-7, abs_tol=0.0):
-        raise ValueError(
-            "source config native pixel size disagrees with --native-pixel-size"
-        )
-    expected_source_pixel = native_side * native_pixel / source_side
-    if not math.isclose(source_pixel, expected_source_pixel, rel_tol=2e-7, abs_tol=0.0):
-        raise ValueError("source and native fields of view do not agree")
-
+def _load_source(summary_path, map_path):
+    """The M3 summary, its map and the voxel size of the map."""
+    config = json.loads(summary_path.read_text())
     with mrcfile.open(map_path, mode="r", permissive=False) as handle:
         volume = np.array(handle.data, dtype=np.float64, copy=True)
         voxel = np.array(
             [float(handle.voxel_size[axis]) for axis in ("x", "y", "z")]
         )
-        axes = (int(handle.header.mapc), int(handle.header.mapr), int(handle.header.maps))
-        starts = tuple(
-            int(handle.header[key]) for key in ("nxstart", "nystart", "nzstart")
-        )
-        origin = tuple(float(handle.header.origin[key]) for key in ("x", "y", "z"))
-    if volume.shape != (source_side,) * 3 or not np.all(np.isfinite(volume)):
-        raise ValueError(
-            f"source map must be a finite {source_side} x {source_side} x "
-            f"{source_side} real volume")
-    if not np.allclose(voxel, source_pixel, rtol=2e-6, atol=0.0):
-        raise ValueError("source map voxel size disagrees with its config")
-    if axes != (1, 2, 3) or starts != (0, 0, 0) or origin != (0.0, 0.0, 0.0):
-        raise ValueError("source map must use canonical MRC axes and a centered origin")
-    return (
-        requested_config_path, authoritative_path, map_path, config, volume,
-        voxel, source_side,
-    )
+    return config, volume, voxel
 
 
 def _common_value(particles, name):
     values = np.asarray(particles.metadata[name])
-    if values.shape != (particles.n,):
-        raise ValueError(f"invalid STAR column shape for {name}")
     try:
         numeric = np.asarray(values, dtype=np.float64)
     except (TypeError, ValueError):
@@ -182,61 +80,9 @@ def _common_value(particles, name):
         if np.any(strings != strings[0]):
             raise ValueError(f"one optics group cannot represent varying {name}")
         return strings[0]
-    if not np.all(np.isfinite(numeric)):
-        raise ValueError(f"nonfinite STAR values in {name}")
     if not np.allclose(numeric, numeric[0], rtol=1e-7, atol=1e-10):
         raise ValueError(f"one optics group cannot represent varying {name}")
     return float(numeric[0])
-
-
-def _validate_particles(
-    star_path,
-    data_folder,
-    stack_prefix,
-    native_side,
-    native_pixel,
-    expected_particles,
-):
-    particles = RelionParticles(
-        star_path,
-        data_folder=data_folder,
-        stack_prefix=stack_prefix,
-        pixel_size=native_pixel,
-    )
-    if particles.res != native_side:
-        raise ValueError(
-            f"raw particles are {particles.res} square, not {native_side} square"
-        )
-    if expected_particles is not None and particles.n != expected_particles:
-        raise ValueError(
-            f"raw-particle STAR has {particles.n} rows, not {expected_particles} rows"
-        )
-    if not math.isclose(
-        particles.pixel_size, native_pixel, rel_tol=2e-7, abs_tol=0.0
-    ):
-        raise ValueError(
-            "effective particle pixel size disagrees with --native-pixel-size"
-        )
-
-    voltage = particles.column("_rlnVoltage")
-    spherical_aberration = particles.column("_rlnSphericalAberration")
-    amplitude_contrast = particles.column("_rlnAmplitudeContrast")
-    defocus_u = particles.column("_rlnDefocusU")
-    defocus_v = particles.column("_rlnDefocusV")
-    particles.column("_rlnDefocusAngle")
-    if np.any(voltage <= 0.0) or np.any(spherical_aberration < 0.0):
-        raise ValueError("invalid voltage or spherical-aberration metadata")
-    if np.any((amplitude_contrast < 0.0) | (amplitude_contrast >= 1.0)):
-        raise ValueError("amplitude contrast must lie in [0, 1)")
-    if np.any(defocus_u <= 0.0) or np.any(defocus_v <= 0.0):
-        raise ValueError("defocus values must be positive")
-    if "_rlnPhaseShift" in particles.metadata:
-        particles.column("_rlnPhaseShift")
-
-    for name in ("_rlnVoltage", "_rlnSphericalAberration", "_rlnAmplitudeContrast"):
-        _common_value(particles, name)
-    # RelionParticles has now checked every referenced stack header and index.
-    return particles
 
 
 def _particle_columns(particles):
@@ -260,23 +106,7 @@ def _particle_columns(particles):
             or name.startswith("_rlnHelical")
             or name == "_rlnPhaseShift"
         ):
-            values = np.asarray(particles.metadata[name])
-            if values.shape != (particles.n,):
-                raise ValueError(f"invalid STAR column shape for {name}")
-            try:
-                numeric = np.asarray(values, dtype=np.float64)
-            except (TypeError, ValueError):
-                strings = np.asarray(values, dtype=str)
-                if any("\n" in value or "\r" in value for value in strings):
-                    raise ValueError(f"multiline STAR value in {name}")
-            else:
-                if not np.all(np.isfinite(numeric)):
-                    raise ValueError(f"nonfinite STAR value in {name}")
             names.append(name)
-    required = {"_rlnDefocusU", "_rlnDefocusV", "_rlnDefocusAngle"}
-    missing = required.difference(names)
-    if missing:
-        raise ValueError(f"particle STAR lacks required CTF columns: {sorted(missing)}")
     return names
 
 
@@ -285,12 +115,8 @@ def _format_star_value(value):
         return str(int(value))
     if isinstance(value, (np.floating, float)):
         value = float(value)
-        if not math.isfinite(value):
-            raise ValueError("cannot write a nonfinite STAR value")
         return format(value, ".17g")
     value = str(value)
-    if "\n" in value or "\r" in value:
-        raise ValueError("multiline STAR values are not supported")
     if not value or any(character.isspace() for character in value) or value[0] in "#_;":
         if "'" not in value:
             return f"'{value}'"
@@ -337,8 +163,7 @@ def _write_relion_star(particles, destination, native_side, native_pixel):
     destination = Path(destination)
     with destination.open("x") as stream:
         stream.write(
-            "# RELION 5 input: absolute raw-particle paths; poses, origins, and "
-            "random subsets deliberately omitted.\n\n"
+            "# RELION 5 input: absolute raw-particle paths; poses, origins and random subsets deliberately omitted.\n\n"
         )
         _write_loop(stream, "optics", optics_labels, [optics_row])
         _write_loop(stream, "particles", particle_labels, particle_rows())
@@ -351,60 +176,13 @@ def _write_relion_star(particles, destination, native_side, native_pixel):
     )
     return {
         "path": str(destination.resolve()),
-        "sha256": _sha256(destination),
-        "format": "RELION 5 optics-plus-particles STAR",
+        "sha256": sha256_file(destination),
         "n_particles": particles.n,
         "n_stacks": len(stack_paths),
-        "optics_groups": 1,
         "optics_columns": optics_labels,
         "particle_columns": particle_labels,
         "dropped_pose_origin_subset_columns": dropped,
-        "absolute_stack_paths": True,
-        "random_subsets_present": False,
     }
-
-
-def _fourier_resample_real(volume, side):
-    volume = np.asarray(volume, dtype=np.float64)
-    if (
-        volume.ndim != 3
-        or len(set(volume.shape)) != 1
-        or volume.shape[0] % 2
-        or side % 2
-    ):
-        raise ValueError("source and native map sides must be even cubes")
-    result = np.fft.ifftshift(volume)
-    for axis in range(3):
-        result = signal.resample(result, side, axis=axis, window=None)
-    result = np.fft.fftshift(result)
-    imaginary = float(np.linalg.norm(np.imag(result)))
-    result = np.asarray(np.real(result), dtype=np.float64)
-    relative_imaginary = imaginary / max(
-        float(np.linalg.norm(result)), np.finfo(float).tiny
-    )
-    if relative_imaginary > 1e-12 or not np.all(np.isfinite(result)):
-        raise FloatingPointError("Fourier interpolation did not produce a finite real map")
-    return result, relative_imaginary
-
-
-def _soft_spherical_support(side, pixel, diameter, edge):
-    inner = diameter / 2.0
-    outer = inner + edge
-    if not 0.0 < inner < outer < side * pixel / 2.0:
-        raise ValueError("particle support must fit strictly inside the native map")
-    coordinate = (np.arange(side, dtype=np.float64) - side // 2) * pixel
-    radius = np.sqrt(
-        coordinate[:, None, None] ** 2
-        + coordinate[None, :, None] ** 2
-        + coordinate[None, None, :] ** 2
-    )
-    mask = np.ones_like(radius)
-    mask[radius >= outer] = 0.0
-    transition = (radius > inner) & (radius < outer)
-    mask[transition] = 0.5 * (
-        1.0 + np.cos(np.pi * (radius[transition] - inner) / edge)
-    )
-    return mask
 
 
 def _write_mrc(path, volume, pixel):
@@ -417,68 +195,14 @@ def _write_mrc(path, volume, pixel):
         handle.update_header_stats()
 
 
-def _positive_int(value):
-    parsed = int(value)
-    if parsed <= 0:
-        raise argparse.ArgumentTypeError("value must be positive")
-    return parsed
-
-
-def _positive_float(value):
-    parsed = float(value)
-    if not math.isfinite(parsed) or parsed <= 0.0:
-        raise argparse.ArgumentTypeError("value must be finite and positive")
-    return parsed
-
-
-def prepare_refinement_main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
-    parser.add_argument("--source-map", required=True, type=Path)
-    parser.add_argument("--source-config", required=True, type=Path)
-    parser.add_argument("--particles", "--particle-star", dest="particle_star",
-                        required=True, type=Path)
-    parser.add_argument("--datadir", "--data-folder", dest="data_folder", type=Path)
-    parser.add_argument("--strip-prefix", "--stack-prefix", dest="stack_prefix")
-    parser.add_argument("--outdir", "-o", "--output-dir", dest="output_dir",
-                        required=True, type=Path)
-    parser.add_argument("--dataset", required=True)
-    parser.add_argument("--native-side", required=True, type=_positive_int)
-    parser.add_argument(
-        "--native-pixel-size", dest="native_pixel", required=True,
-        type=_positive_float,
-    )
-    parser.add_argument(
-        "--expected-particles", type=_positive_int,
-        help="expected STAR row count; inferred when omitted",
-    )
-    parser.add_argument("--particle-diameter", required=True, type=_positive_float)
-    args = parser.parse_args(argv)
-
-    dataset = _canonical_dataset(args.dataset)
-    output = args.output_dir.resolve()
-    if output.exists() and any(output.iterdir()):
-        raise FileExistsError("--outdir must be new or empty")
-    if args.native_side % 2:
-        parser.error("--native-side must be even")
-
-    (requested_config_path, authoritative_config_path, map_path, config,
-     source, source_voxel, source_side) = _load_source(
-         args.source_config,
-         args.source_map,
-         dataset,
-         args.native_side,
-         args.native_pixel,
-     )
-    particles = _validate_particles(
-        args.particle_star,
-        args.data_folder,
-        args.stack_prefix,
-        args.native_side,
-        args.native_pixel,
-        args.expected_particles,
-    )
-    native, imaginary_error = _fourier_resample_real(source, args.native_side)
-    restored, _ = _fourier_resample_real(native, source_side)
+def prepare_refinement(source_summary, source_map, particles, output, dataset, native_side, native_pixel, data_folder, stack_prefix):
+    """Write the RELION inputs of a finished pipeline run to the new ``output`` directory: the M3 map resampled to the native
+    grid, the particle STAR without poses or origins, and
+    ``provenance.json`` (returned)."""
+    config, source, source_voxel = _load_source(source_summary, source_map)
+    source_side = source.shape[0]
+    native, imaginary_error = fourier_resample_real(source, native_side)
+    restored, _ = fourier_resample_real(native, source_side)
     roundtrip_error = float(
         np.linalg.norm(restored - source)
         / max(float(np.linalg.norm(source)), np.finfo(float).tiny)
@@ -488,13 +212,8 @@ def prepare_refinement_main(argv=None):
         / max(abs(float(source.mean())), float(np.linalg.norm(source)) / source.size,
               np.finfo(float).tiny)
     )
-    if roundtrip_error > 2e-11 or mean_error > 2e-11:
-        raise FloatingPointError(
-            "Fourier-resampling validation failed: "
-            f"roundtrip={roundtrip_error:.3e}, mean={mean_error:.3e}"
-        )
     # The initializer handed to RELION is the Fourier-resampled MoM map itself:
-    # no support mask and no pre-filter. RELION's --ini_high low-passes it.
+    # no support mask and no pre-filter.
 
     output.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".prepare-relion-", dir=output) as temporary:
@@ -502,83 +221,47 @@ def prepare_refinement_main(argv=None):
         star_report = _write_relion_star(
             particles,
             staging / "particles.star",
-            args.native_side,
-            args.native_pixel,
+            native_side,
+            native_pixel,
         )
         star_report["path"] = str((output / "particles.star").resolve())
-        _write_mrc(staging / "initial_model.mrc", native, args.native_pixel)
+        _write_mrc(staging / "initial_model.mrc", native, native_pixel)
         provenance = {
             "created_utc": datetime.now(timezone.utc).isoformat(),
             "dataset": dataset,
             "source": {
-                "config_argument": str(requested_config_path),
-                "config_argument_sha256": _sha256(requested_config_path),
-                "authoritative_summary": str(authoritative_config_path),
-                "authoritative_summary_sha256": _sha256(
-                    authoritative_config_path),
-                "map": str(map_path),
-                "map_sha256": _sha256(map_path),
-                "order": 3,
+                "summary": str(source_summary),
+                "summary_sha256": sha256_file(source_summary),
+                "map": str(source_map),
+                "map_sha256": sha256_file(source_map),
                 "n_initializations": config["n_initializations"],
                 "side": source_side,
                 "pixel_size_angstrom": source_voxel.tolist(),
                 "field_of_view_angstrom": source_side * float(source_voxel[0]),
-                "fit_complete": config.get("fit_complete"),
-                "complete": config.get("complete"),
             },
             "native_geometry": {
-                "side": args.native_side,
-                "pixel_size_angstrom": args.native_pixel,
-                "field_of_view_angstrom": args.native_side * args.native_pixel,
+                "side": native_side,
+                "pixel_size_angstrom": native_pixel,
+                "field_of_view_angstrom": native_side * native_pixel,
             },
             "fourier_resampling": {
-                "method": "centered separable scipy.signal.resample",
-                "lowpass_applied": False,
-                "amplitude_rescaling": False,
                 "relative_roundtrip_error": roundtrip_error,
                 "relative_mean_error": mean_error,
                 "relative_imaginary_norm": imaginary_error,
             },
-            "initializer": {
-                "support_mask_applied": False,
-                "lowpass_applied": False,
-                "note": "RELION --ini_high low-passes the reference at start-up",
-                "particle_diameter_angstrom": args.particle_diameter,
-            },
             "particles": {
                 "source_star": str(particles.star_path),
-                "source_star_sha256": _sha256(particles.star_path),
+                "source_star_sha256": sha256_file(particles.star_path),
                 "source_fingerprint": particles.fingerprint(),
-                "data_folder": str(
-                    particles.star_path.parent
-                    if args.data_folder is None
-                    else Path(args.data_folder).resolve(strict=True)
-                ),
-                "stack_prefix": args.stack_prefix,
+                "data_folder": str(particles.star_path.parent if data_folder is None else data_folder),
+                "stack_prefix": stack_prefix,
                 "n_particles": particles.n,
                 "n_stacks": len(particles.stack_paths),
                 "native_side": particles.res,
                 "native_pixel_size_angstrom": particles.pixel_size,
                 "metadata_pixel_size_angstrom": particles.metadata_pixel_size,
-                "all_stack_headers_and_indices_validated": True,
-                "ctf_metadata_validated": True,
             },
             "output_star": star_report,
-            "output_files": {
-                "initial_model": "initial_model.mrc",
-                "particles": "particles.star",
-            },
-            "relion_initialization": {
-                "poses_inherited": False,
-                "origins_inherited": False,
-                "random_subsets_inherited": False,
-                "ctf_metadata_preserved": True,
-                "coordinate_metadata_preserved_when_present": True,
-            },
-            "implementation": {
-                "script": str(Path(__file__).resolve()),
-                "script_sha256": _sha256(__file__),
-            },
         }
         (staging / "provenance.json").write_text(
             json.dumps(provenance, indent=2) + "\n"
@@ -592,15 +275,11 @@ def prepare_refinement_main(argv=None):
 
 def _safe_symmetry(value: str) -> str:
     symmetry = str(value).strip().upper()
-    if not re.fullmatch(r"[A-Z][A-Z0-9]*", symmetry):
-        raise ValueError("RELION symmetry must look like C1, D2, O, or I1")
     return symmetry
 
 
 def _shell_literal(value) -> str:
     text = os.fspath(value) if isinstance(value, os.PathLike) else str(value)
-    if "\n" in text or "\r" in text:
-        raise ValueError("shell-script values cannot contain newlines")
     return shlex.quote(text)
 
 
@@ -723,9 +402,6 @@ def _copied_sbatch_header(script_text, overrides):
         option = option.split("=", 1)[0].split(None, 1)[0]
         if option not in _SBATCH_OVERRIDDEN_OPTIONS:
             header.append(stripped)
-    if not header:
-        raise RuntimeError(
-            "the submitting SLURM script has no #SBATCH header to copy")
     header.extend(f"#SBATCH {name}={value}"
                   for name, value in overrides.items())
     return header
@@ -737,9 +413,8 @@ def _write_refinement_script(preparation, dataset, parameters):
     preparation = Path(preparation).resolve()
     result = preparation.parent / "relion_refine"
     script = preparation / "run_refinement.sh"
-    job_suffix = dataset.split("-", 1)[1]
+    job_suffix = dataset.split("-", 1)[-1]
     diameter = parameters["particle_diameter_angstrom"]
-    ini_high = parameters["ini_high_angstrom"]
     offset_range = parameters["offset_range_pixels"]
     offset_step = parameters["offset_step_pixels"]
     low_resol_join_halves = parameters["low_resol_join_halves_angstrom"]
@@ -801,8 +476,6 @@ def _write_refinement_script(preparation, dataset, parameters):
         'for name in particles.star initial_model.mrc provenance.json; do',
         '    cp "$PREPARED/$name" "$JOB/inputs/$name"',
         'done',
-        f'sha256sum "$ROOT/src/kam/command_line.py" '
-        f'{_shell_literal(Path(__file__).resolve())} > "$JOB/code_sha256.txt"',
         'sha256sum "$JOB/inputs/"* > "$JOB/input_sha256.txt"',
         'START_SECONDS=$(date +%s)',
         'trap \'status=$?; elapsed=$(( $(date +%s) - START_SECONDS )); printf "{\\"elapsed_seconds\\": %s, \\"exit_code\\": %s}\\n" "$elapsed" "$status" > "$JOB/timing.json"\' EXIT',
@@ -821,8 +494,7 @@ def _write_refinement_script(preparation, dataset, parameters):
         "command -v relion_refine_mpi | tee relion_executable.txt",
         "nvidia-smi --query-gpu=name,memory.total --format=csv",
         "",
-        f"# The initializer is the unmasked, unfiltered MoM map; ini_high {ini_high:g} A low-passes it.",
-        "# ini_high also controls RELION's initial working resolution and CC iteration.",
+        "# The initializer is the unmasked MoM map; RELION low-passes it to 60 A (--ini_high 60, the GUI default).",
         "command=(",
         '    srun --export=ALL --mpi=pmix_v3 --kill-on-bad-exit=1 -n 3 -c "$OMP_NUM_THREADS"',
         (f"    --gres={gres} --cpu-bind=cores --gpu-bind=none"
@@ -830,7 +502,7 @@ def _write_refinement_script(preparation, dataset, parameters):
         f"    bash -c {shlex.quote(rank_launcher)} relion_rank",
         '    --i "$JOB/inputs/particles.star" --ref "$JOB/inputs/initial_model.mrc"',
         '    --o "$JOB/run" --auto_refine --split_random_halves',
-        f"    --firstiter_cc --trust_ref_size --ini_high {ini_high:.17g}",
+        "    --firstiter_cc --trust_ref_size --ini_high 60",
         f"    --ctf --sym {_shell_literal(symmetry)} --particle_diameter {diameter:.17g}",
         "    --flatten_solvent --zero_mask --norm --scale",
         "    --oversampling 1 --healpix_order 2 --auto_local_healpix_order 4",
@@ -852,13 +524,35 @@ def _write_refinement_script(preparation, dataset, parameters):
         "result_dir": str(result),
         "dataset": dataset,
         "mpi_ranks": 3,
-        "gpu_mapping": "automatic_per_rank_visible_devices",
-        "gpu_preflight": "per-rank CUDA runtime enumeration and context initialization",
         "requested_gpus": gres,
-        "slurm_submission_waits": True,
-        "inputs_copied_to_job": True,
         **parameters,
     }
+
+
+# RELION's mask (particle) diameter is MASK_DIAMETER_FACTOR times the diameter of the mean particle image that encloses
+# MASK_MASS_FRACTION of its positive mass; the mean image is the radial profile given by the first moment (no reference).
+MASK_DIAMETER_FACTOR = 1.25
+MASK_MASS_FRACTION = 0.99
+
+
+def particle_diameter_from_m1(prepared_dir):
+    """Diameter (Angstrom) of the mean denoised particle image from the first moment of ``prepared_dir/moments.npz``.
+
+    M1 = E c_0 holds the rotationally averaged Fourier transform of the mean image on the FB radial nodes; its Hankel transform is the
+    real-space radial profile f(r).  Returns 2 R with ``int_0^R max(f, 0) r dr`` equal to MASK_MASS_FRACTION of the total."""
+    from scipy.special import jv
+
+    with np.load(Path(prepared_dir) / "moments.npz", allow_pickle=False) as saved:
+        nodes, weights = saved["fb_radial_nodes"], saved["fb_radial_weights"]
+        radial0 = saved["fb_radial_basis"][:, : int(saved["fb_radial_counts"][0])]
+        m1 = np.real(saved["mbar1"])
+        side, pixel = int(saved["ds_res"]), float(saved["pixel_size"])
+    # kappa w F(kappa) on the radial nodes (the radial basis carries sqrt(kappa w)), up to a constant
+    hankel = np.sqrt(nodes * weights) * (radial0 @ m1)
+    r = np.linspace(0.0, side / 2, 4001)
+    profile = jv(0, 2 * np.pi * np.outer(r, nodes)) @ hankel
+    mass = np.cumsum(np.maximum(profile * np.sign(profile[0]), 0.0) * r)
+    return float(2 * r[np.searchsorted(mass / mass[-1], MASK_MASS_FRACTION)] * pixel)
 
 
 def relion_prepare_main(argv=None):
@@ -870,19 +564,12 @@ def relion_prepare_main(argv=None):
             "Della-specific run_refinement.sh used by these experiments."),
         allow_abbrev=False)
     parser.add_argument("--pipeline-dir", required=True, type=Path)
-    parser.add_argument("--particles", "--particle-star", dest="particle_star", type=Path,
+    parser.add_argument("--particles", dest="particle_star", type=Path,
                         help="override the raw STAR used by pipeline")
-    parser.add_argument("--datadir", "--data-folder", dest="data_folder", type=Path)
-    parser.add_argument("--strip-prefix", "--stack-prefix", dest="stack_prefix")
-    parser.add_argument("--native-pixel-size", type=_positive_float)
-    parser.add_argument("--expected-particles", type=_positive_int)
-    parser.add_argument("--particle-diameter", required=True, type=_positive_float)
-    parser.add_argument("--symmetry", default="C1")
-    parser.add_argument("--ini-high", type=_positive_float, default=30.0,
-                        help="initializer low-pass and RELION startup resolution in A")
-    parser.add_argument("--offset-range", type=_positive_float, default=40.0)
-    parser.add_argument("--offset-step", type=_positive_float, default=4.0)
-    parser.add_argument("--low-resol-join-halves", type=_positive_float, default=40.0)
+    parser.add_argument("--datadir", dest="data_folder", type=Path)
+    parser.add_argument("--native-pixel-size", type=float)
+    parser.add_argument("--symmetry", help="RELION --sym; default: the symmetry of the pipeline's volume")
+    parser.add_argument("--low-resol-join-halves", type=float, default=40.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction,
                         default=True,
@@ -894,75 +581,41 @@ def relion_prepare_main(argv=None):
     pipeline = args.pipeline_dir.expanduser().resolve(strict=True)
     manifest_path = pipeline / "pipeline_config.json"
     manifest = json.loads(manifest_path.read_text())
-    configuration = manifest.get("configuration", manifest)
+    configuration = manifest["configuration"]
     dataset = _canonical_dataset(configuration["dataset_label"])
-    dataset_number = dataset.split("-", 1)[1]
-    run_name = pipeline.parent.name
-    slurm_run = re.fullmatch(
-        rf"{re.escape(dataset_number)}_[0-9]+", run_name)
-    local_run = re.fullmatch(
-        rf"{re.escape(dataset_number)}_local_[0-9]{{8}}T[0-9]{{12}}Z_[0-9]+",
-        run_name,
-    )
-    if pipeline.name != "kam_pipeline" or not (slurm_run or local_run):
-        raise ValueError(
-            "--pipeline-dir must have layout "
-            f"{dataset_number}_<SLURM_JOB_ID>/kam_pipeline")
     inputs = configuration["inputs"]
-    source_config = pipeline / "MoM/M3/config.json"
+    source_summary = pipeline / "MoM/M3/summary.json"
     source_map = pipeline / "MoM/M3/recon.mrc"
-    source = json.loads(source_config.read_text())
-    native_side = int(source["native_side"])
-    native_pixel = float(source["native_pixel_size_angstrom"])
-    if args.native_pixel_size is not None:
-        native_pixel = args.native_pixel_size
-    denoise_manifest = pipeline / "denoise/manifest.npz"
-    with np.load(denoise_manifest, allow_pickle=False) as saved:
-        denoise_side = int(np.asarray(saved["native_res"]).item())
-        denoise_pixel = float(np.asarray(saved["vox_native"]).item())
-    if native_side != denoise_side or not math.isclose(
-            native_pixel, denoise_pixel, rel_tol=2e-7, abs_tol=0.0):
-        raise ValueError("native particle geometry differs from the denoising manifest")
-    source_details = _load_source(
-        source_config, source_map, dataset, native_side, native_pixel)
-    del source_details
-    particle_star = (args.particle_star if args.particle_star is not None
-                     else Path(inputs["star_path"]))
+    particle_star = (args.particle_star if args.particle_star is not None else Path(inputs["star_path"]))
     particle_star = particle_star.expanduser().resolve(strict=True)
     data_folder = args.data_folder
-    stack_prefix = args.stack_prefix
+    stack_prefix = None
     if args.particle_star is None:
         if data_folder is None and inputs.get("data_folder") is not None:
             data_folder = Path(inputs["data_folder"])
-        if stack_prefix is None:
-            stack_prefix = inputs.get("stack_prefix")
+        stack_prefix = inputs.get("stack_prefix")
     if data_folder is not None:
         data_folder = data_folder.expanduser().resolve(strict=True)
-    particles = _validate_particles(
-        particle_star, data_folder, stack_prefix, native_side,
-        native_pixel, args.expected_particles)
-    if args.particle_diameter >= native_side * native_pixel:
-        raise ValueError("particle diameter does not fit inside the box")
-    if args.ini_high < 2.0 * native_pixel:
-        raise ValueError("--ini-high must be at least the native Nyquist resolution")
+    particles = RelionParticles(
+        particle_star, data_folder=data_folder, stack_prefix=stack_prefix, pixel_size=args.native_pixel_size)
+    # RELION refines the images of particle_star (the raw images, also when the moments used Fourier-cropped copies of them):
+    # their box and pixel size are the native grid the MoM map is resampled to (same field of view).
+    native_side, native_pixel = particles.res, particles.pixel_size
     parameters = {
-        "particle_diameter_angstrom": args.particle_diameter,
-        "symmetry": _safe_symmetry(args.symmetry),
-        "ini_high_angstrom": args.ini_high,
-        "offset_range_pixels": args.offset_range,
-        "offset_step_pixels": args.offset_step,
+        "particle_diameter_angstrom": MASK_DIAMETER_FACTOR * particle_diameter_from_m1(pipeline / "MoM" / "prepared"),
+        "symmetry": _safe_symmetry(args.symmetry or configuration["model"]["symmetry"]),
+        # The same translational search for every dataset: up to 1/8 of the box (the support of the MoM shift rings), 11 steps per axis.
+        "offset_range_pixels": native_side / 8,
+        "offset_step_pixels": native_side / 40,
         "low_resol_join_halves_angstrom": args.low_resol_join_halves,
         "seed": args.seed,
     }
     preparation = pipeline.parent / "relion_prepare"
     request = {
-        "schema_version": 1,
-        "relion_driver_sha256": _sha256(__file__),
         "pipeline_dir": str(pipeline),
-        "pipeline_manifest_sha256": _sha256(manifest_path),
-        "source_map_sha256": _sha256(source_map),
-        "source_config_sha256": _sha256(source_config),
-        "source_summary_sha256": _sha256(source_config.with_name("summary.json")),
+        "pipeline_manifest_sha256": sha256_file(manifest_path),
+        "source_map_sha256": sha256_file(source_map),
+        "source_summary_sha256": sha256_file(source_summary),
         "dataset": dataset,
         "particle_star": str(particle_star),
         "particle_source_fingerprint": particles.fingerprint(),
@@ -973,7 +626,7 @@ def relion_prepare_main(argv=None):
         "n_particles": particles.n,
         "parameters": parameters,
     }
-    validation_done = time.perf_counter()
+    inputs_loaded = time.perf_counter()
     if args.dry_run:
         print(json.dumps({"request": request, "preparation_dir": str(preparation),
                           "refinement_script": str(preparation / "run_refinement.sh"),
@@ -988,44 +641,23 @@ def relion_prepare_main(argv=None):
         previous = json.loads(provenance_path.read_text())
         if previous.get("preparation_request") != request or not previous.get("complete"):
             raise ValueError("existing preparation is incomplete or uses different inputs/settings")
-        hashes = previous.get("prepared_file_sha256", {})
-        required = {"particles.star", "initial_model.mrc", "run_refinement.sh"}
-        if set(hashes) != required:
-            raise ValueError("existing preparation lacks complete output checksums")
-        for name, expected_hash in hashes.items():
-            if _sha256(preparation / name) != expected_hash:
-                raise ValueError(f"prepared file changed: {preparation / name}")
-        print(f"Reusing validated RELION preparation: {preparation}", flush=True)
+        print(f"Reusing RELION preparation: {preparation}", flush=True)
         print(f"Run: bash {shlex.quote(str(preparation / 'run_refinement.sh'))}", flush=True)
         return 0
 
-    command = [
-        "--source-map", str(source_map), "--source-config", str(source_config),
-        "--particles", str(particle_star), "--outdir", str(preparation),
-        "--dataset", dataset, "--native-side", str(native_side),
-        "--native-pixel-size", str(native_pixel),
-        "--expected-particles", str(particles.n),
-        "--particle-diameter", str(args.particle_diameter),
-    ]
-    if data_folder is not None:
-        command.extend(["--datadir", str(data_folder)])
-    if stack_prefix is not None:
-        command.extend(["--strip-prefix", stack_prefix])
-    provenance = prepare_refinement_main(command)
+    provenance = prepare_refinement(
+        source_summary, source_map, particles, preparation, dataset, native_side, native_pixel, data_folder, stack_prefix)
     inputs_done = time.perf_counter()
     refinement = _write_refinement_script(preparation, dataset, parameters)
     provenance.update(
         preparation_request=request,
         refinement=refinement,
         complete=True,
-        prepared_file_sha256={
-            name: _sha256(preparation / name)
-            for name in ("particles.star", "initial_model.mrc", "run_refinement.sh")},
     )
     completed = time.perf_counter()
     provenance["timings_seconds"] = {
-        "input_validation": validation_done - started,
-        "native_map_and_star_preparation": inputs_done - validation_done,
+        "input_loading": inputs_loaded - started,
+        "native_map_and_star_preparation": inputs_done - inputs_loaded,
         "launcher_and_output_checksums": completed - inputs_done,
         "total": completed - started,
     }
@@ -1038,10 +670,6 @@ def relion_prepare_main(argv=None):
     print(f"RELION preparation complete: {preparation}", flush=True)
     print(f"Run: bash {shlex.quote(refinement['script'])}", flush=True)
     return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(relion_prepare_main())
 
 
 # ===========================================================================
@@ -1063,8 +691,7 @@ def _largest_component(mask):
     return labels == (1 + int(np.argmax(sizes)))
 
 
-def solvent_mask_from_map(volume, pixel_size, molecular_weight=None,
-                          diameter=None, lowpass=15.0, extend=3,
+def solvent_mask_from_map(volume, pixel_size, molecular_weight, lowpass=15.0, extend=3,
                           edge_angstrom=6.0):
     """Build a reference-free solvent mask from a reconstruction.
 
@@ -1072,21 +699,11 @@ def solvent_mask_from_map(volume, pixel_size, molecular_weight=None,
     molecular volume rather than by eye, on a low-passed copy so that noise
     cannot define the support; the mask is then restricted to its largest
     component, extended, and given a cosine edge, because a hard edge
-    convolves the Fourier shells and inflates the masked FSC. Without a
-    molecular weight the mask falls back to the soft sphere already used for
-    the refinement input.
+    convolves the Fourier shells and inflates the masked FSC.
     """
     from scipy import ndimage
 
     volume = np.asarray(volume, dtype=np.float64)
-    side = volume.shape[0]
-    if molecular_weight is None:
-        if diameter is None:
-            raise ValueError("give either molecular_weight or diameter")
-        return _soft_spherical_support(
-            side, pixel_size, float(diameter), edge_angstrom), dict(
-                kind="soft sphere", diameter_angstrom=float(diameter),
-                cosine_edge_angstrom=float(edge_angstrom))
     smoothed = ndimage.gaussian_filter(
         volume, lowpass / (2.355 * pixel_size))
     target_voxels = (float(molecular_weight)
@@ -1103,7 +720,6 @@ def solvent_mask_from_map(volume, pixel_size, molecular_weight=None,
     mask[grown] = 1.0
     mask[distance >= edge_angstrom] = 0.0
     return mask, dict(
-        kind="molecular-volume threshold on a low-passed map",
         lowpass_angstrom=float(lowpass),
         molecular_weight_daltons=float(molecular_weight),
         volume_per_dalton_cubic_angstrom=_POSTPROCESS_PROTEIN_VOLUME_PER_DALTON,
@@ -1113,7 +729,6 @@ def solvent_mask_from_map(volume, pixel_size, molecular_weight=None,
         mask_weight_fraction=float(mask.mean()),
         extend_voxels=int(extend),
         cosine_edge_angstrom=float(edge_angstrom),
-        largest_component_only=True,
     )
 
 
@@ -1141,10 +756,8 @@ def postprocess_main(argv=None):
                         help="relion_refine directory holding job_<id>")
     parser.add_argument("--outdir", type=Path,
                         help="defaults to <relion-dir>/../postprocess")
-    parser.add_argument("--molecular-weight", type=float,
+    parser.add_argument("--molecular-weight", type=float, required=True,
                         help="complex mass in daltons; sets the mask threshold")
-    parser.add_argument("--particle-diameter", type=float,
-                        help="fallback soft-sphere diameter in Angstrom")
     parser.add_argument("--mask-lowpass", type=float, default=15.0)
     parser.add_argument("--mask-extend", type=int, default=3)
     parser.add_argument("--mask-edge", type=float, default=6.0)
@@ -1168,8 +781,7 @@ def postprocess_main(argv=None):
         refined = handle.data.astype(np.float64)
         pixel_size = float(handle.voxel_size.x)
     mask, mask_report = solvent_mask_from_map(
-        refined, pixel_size, molecular_weight=args.molecular_weight,
-        diameter=args.particle_diameter, lowpass=args.mask_lowpass,
+        refined, pixel_size, args.molecular_weight, lowpass=args.mask_lowpass,
         extend=args.mask_extend, edge_angstrom=args.mask_edge)
     _write_mrc(output / "mask.mrc", mask, pixel_size)
     print(f"solvent mask: {json.dumps(mask_report)}", flush=True)
@@ -1201,13 +813,9 @@ def postprocess_main(argv=None):
         bfactor_used_for_sharpening=float(
             values["_rlnBfactorUsedForSharpening"]),
         fsc_criterion=0.143,
-        mask_reference_free=True,
         mask=mask_report,
         pixel_size_angstrom=pixel_size,
         postprocessed_map=str(output / "postprocess.mrc"),
-        phase_randomization_correction="applied by relion_postprocess",
-        note=("masked, phase-randomization-corrected gold-standard FSC; "
-              "comparable with published resolutions"),
     )
     (output / "postprocess_report.json").write_text(
         json.dumps(report, indent=2))

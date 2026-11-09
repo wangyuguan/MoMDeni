@@ -2,14 +2,16 @@
 """Denoised-particle Fourier--Bessel moment reconstruction.
 
     kam pipeline particles.star --outdir results ...
-                              denoise, select, reconstruct M2 then M3
+                              denoise, select, reconstruct M1, M2 and M3
+    kam reconstruct denoised.mrcs --outdir out ...
+                              M1, M2 and M3 of a stack of denoised images
     kam align_reference ...   align initial/refined maps and plot FSC
 
 Each pipeline run writes to
 ``<results>/<EMPIAR-number>_<SLURM-job-id>/kam_pipeline``. Local runs use a
-collision-resistant ``local`` identifier. Optional RELION preparation is an
-experiment-specific workflow outside ``src``; reference comparison remains a
-separate downstream command.
+collision-resistant ``local`` identifier. ``kam relion_prepare`` and
+``kam postprocess`` then prepare and finish the RELION refinement;
+``kam align_reference`` compares the maps with a reference.
 The pipeline saves resolved settings to hyperparameters.json and appends live
 progress, subprocess output, and errors to run.log.
 """
@@ -17,8 +19,8 @@ progress, subprocess output, and errors to run.log.
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict
 from datetime import datetime, timezone
-import hashlib
 import json
 import math
 import os
@@ -40,54 +42,19 @@ from matplotlib.patches import Rectangle
 import mrcfile
 import numpy as np
 
-from .centering import (METHOD as CENTERING_METHOD,
-                        METHOD_VERSION as CENTERING_METHOD_VERSION,
-                        CenteringConfig)
-from .denoise import (CENTERING_PREVIEW_DESCRIPTION,
-                     CENTERING_PREVIEW_MARKER_SEMANTICS,
-                     FastCWFDenoiseConfig, denoise_relion_particles,
-                     save_centering_preview)
+from .denoise import DEFAULT_DENOISE_MAX_ORDER, FastCWFDenoiseConfig, denoise_relion_particles
 from . import postprocessing
-from .postprocessing import ReconstructionConfig, reconstruct_single_moment
+from .postprocessing import (DEFAULT_DENOISE_RES, DEFAULT_ELL_MAX, DEFAULT_MOMENT_RES, M3_MAXITER, MAXITER,
+                             N_INIT, DEFAULT_N_SELECT, DEFAULT_SHIFT_STEP_PX, DEFAULT_VIEWING_DEGREE, ReconstructionConfig,
+                             reconstruct_single_moment)
 from .preprocessing import (RelionParticles, nearest_particle_distances,
                            select_low_crowding_particles)
-from .utils import capture_run_log, show_particle_image
+from .utils import ROOT, capture_run_log, git_commit, sha256_file, show_particle_image
 
-ROOT = Path(__file__).resolve().parents[2]
-PACKAGE_DIR = Path(__file__).resolve().parent
-_THIS_FILE = Path(__file__).resolve()
-PARTICLE_SELECTION_SOURCE = PACKAGE_DIR / "preprocessing.py"
 # ===========================================================================
 # MoM pipeline orchestration
 # ===========================================================================
 
-PIPELINE_VERSION = "fourier_bessel_mom_v11"
-
-RECONSTRUCTION_IMPLEMENTATION_FILES = {
-    "moment_reconstruction": PACKAGE_DIR / "postprocessing.py",
-    "viewing": PACKAGE_DIR / "viewing.py",
-    "moments": PACKAGE_DIR / "moments.py",
-    "optimization": PACKAGE_DIR / "optimization.py",
-    "simulation": PACKAGE_DIR / "simulation.py",
-    "utils": PACKAGE_DIR / "utils.py",
-}
-PIPELINE_IMPLEMENTATION_FILES = {
-    "pipeline": _THIS_FILE,
-    "denoising": PACKAGE_DIR / "denoise.py",
-    "centering": PACKAGE_DIR / "centering.py",
-    "preprocessing": PACKAGE_DIR / "preprocessing.py",
-    **RECONSTRUCTION_IMPLEMENTATION_FILES,
-}
-
-DEFAULT_DENOISE_RES = 64
-DEFAULT_MOMENT_RES = 16
-DEFAULT_N_SELECT = 10_000
-DEFAULT_ELL_MAX = 5
-DEFAULT_VIEWING_DEGREE = 2
-DEFAULT_SPHERE_NODES = 200
-DEFAULT_N_INIT = 1
-DEFAULT_MAXITER = 10_000
-DEFAULT_MAX_M3_ENTRIES = 10_000_000
 DEFAULT_NEIGHBOR_FRACTION = 280.0 / 380.0
 PIPELINE_HEARTBEAT_SECONDS = 60.0
 LOCAL_RUN_ID = (
@@ -96,20 +63,8 @@ LOCAL_RUN_ID = (
 )
 
 
-def _sha256(path) -> str:
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as stream:
-        for block in iter(lambda: stream.read(8 * 1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-
 def _read_json(path: Path) -> dict:
-    with path.open() as stream:
-        value = json.load(stream)
-    if not isinstance(value, dict):
-        raise ValueError(f"expected a JSON object in {path}")
-    return value
+    return json.loads(Path(path).read_text())
 
 
 def _write_json_exclusive(path: Path, value: dict) -> None:
@@ -138,77 +93,6 @@ def _write_json_atomic(path: Path, value: dict) -> None:
             temporary.unlink()
 
 
-def _validate_optional_timing(record: dict, context: str) -> None:
-    """Validate timing metadata when present, while accepting older outputs."""
-    if "elapsed_seconds" in record:
-        elapsed = record["elapsed_seconds"]
-        if (isinstance(elapsed, bool) or not isinstance(elapsed, (int, float))
-                or not math.isfinite(float(elapsed)) or float(elapsed) < 0):
-            raise ValueError(f"{context} has invalid elapsed_seconds")
-    if "timings_seconds" in record:
-        timings = record["timings_seconds"]
-        if not isinstance(timings, dict):
-            raise ValueError(f"{context} has invalid timings_seconds")
-        for name, value in timings.items():
-            if (isinstance(value, bool)
-                    or not isinstance(value, (int, float))
-                    or not math.isfinite(float(value)) or float(value) < 0):
-                raise ValueError(
-                    f"{context} has invalid timing {name!r}: {value!r}")
-
-
-def _code_identity(path: Path) -> dict:
-    return {"path": str(path.resolve()), "sha256": _sha256(path)}
-
-
-def _fingerprint(files: dict[str, Path]) -> dict:
-    """Hash a named set of source files in stable name order."""
-    return {
-        name: _code_identity(files[name])
-        for name in sorted(files)
-    }
-
-
-def _implementation_fingerprint() -> dict:
-    return _fingerprint(PIPELINE_IMPLEMENTATION_FILES)
-
-
-def _reconstruction_implementation_fingerprint() -> dict:
-    return _fingerprint(RECONSTRUCTION_IMPLEMENTATION_FILES)
-
-
-def _validate_recorded_implementation(recorded: object, context: str) -> None:
-    """Verify every recorded implementation file against its current bytes."""
-    if not isinstance(recorded, dict) or not recorded:
-        raise ValueError(f"{context} lacks an implementation fingerprint")
-    for name, identity in recorded.items():
-        if (not isinstance(identity, dict)
-                or not isinstance(identity.get("path"), str)
-                or not isinstance(identity.get("sha256"), str)):
-            raise ValueError(
-                f"{context} has an invalid implementation identity for {name}")
-        path = Path(identity["path"])
-        if not path.is_file():
-            raise ValueError(
-                f"{context} implementation file is missing for {name}: {path}")
-        actual = _sha256(path)
-        if actual != identity["sha256"]:
-            raise ValueError(
-                f"{context} implementation changed for {name}: {path}")
-
-
-def _validate_pipeline_manifest(previous: dict, configuration: dict) -> None:
-    if previous.get("configuration") != configuration:
-        raise ValueError(
-            "pipeline arguments differ from the existing pipeline_config.json; "
-            "use the original arguments or a new output directory")
-    current = _implementation_fingerprint()
-    if previous.get("implementation") != current:
-        raise ValueError(
-            "pipeline implementation differs from pipeline_config.json; "
-            "resume in a new output directory to avoid mixing code versions")
-
-
 def _optional_path(value: Path | None) -> str | None:
     return None if value is None else str(value.expanduser().resolve())
 
@@ -218,20 +102,14 @@ def _dataset_label(args: argparse.Namespace) -> str:
         label = args.dataset_label.strip()
     else:
         label = args.star_path.stem
-    if not label:
-        raise ValueError("dataset label cannot be empty")
     return label
 
 
 def _dataset_number(args: argparse.Namespace) -> str:
-    """Return the numeric EMPIAR identifier used in stable result names."""
-    match = re.fullmatch(r"EMPIAR-(\d+)", _dataset_label(args), re.IGNORECASE)
-    if match is None:
-        raise ValueError(
-            "--dataset-label must have the form EMPIAR-10073 so result "
-            "directories can be organized under "
-            "results/10073_<SLURM_JOB_ID>/kam_pipeline")
-    return match.group(1)
+    """The name of the run folder: the EMPIAR number of an ``EMPIAR-<number>`` label, otherwise the label."""
+    label = _dataset_label(args)
+    match = re.fullmatch(r"EMPIAR-(\d+)", label, re.IGNORECASE)
+    return match.group(1) if match else re.sub(r"[^A-Za-z0-9_.-]", "_", label)
 
 
 def _execution_id() -> str:
@@ -240,24 +118,15 @@ def _execution_id() -> str:
     if job_id is None:
         return LOCAL_RUN_ID
     job_id = job_id.strip()
-    if re.fullmatch(r"[0-9]+", job_id) is None:
-        raise ValueError("SLURM_JOB_ID must contain only decimal digits")
     return job_id
 
 
-def _centering_algorithm_configuration(args: argparse.Namespace) -> dict | None:
-    """Resolve dataset-centerer defaults from the algorithm's own configuration."""
-    if not args.centering:
-        return None
-    from dataclasses import asdict
-
-    return asdict(CenteringConfig())
-
-
 def _configuration(args: argparse.Namespace) -> dict:
-    """Return the immutable, dataset-agnostic pipeline configuration."""
+    """Every setting that determines the output of a stage.
+
+    It is recorded once in pipeline_config.json and in each stage that finishes; a finished stage is reused only when
+    its recorded configuration equals the current one."""
     return {
-        "pipeline_version": PIPELINE_VERSION,
         "dataset_label": _dataset_label(args),
         "inputs": {
             "star_path": str(args.star_path.expanduser().resolve()),
@@ -266,7 +135,6 @@ def _configuration(args: argparse.Namespace) -> dict:
             "native_pixel_size": args.native_pixel_size,
         },
         "denoising": {
-            "sampling": "all_STAR_rows",
             "seed": args.seed,
             "resolution": args.denoise_res,
             "fle_max_order": args.denoise_max_order,
@@ -275,54 +143,26 @@ def _configuration(args: argparse.Namespace) -> dict:
             "ctf_mean_defocus_bin_angstrom": args.ctf_mean_defocus_bin,
             "background_radius": args.background_radius,
             "flip_sign": args.flip_sign,
-            "centering": {
-                "enabled": args.centering,
-                "method": CENTERING_METHOD if args.centering else "none",
-                "method_version": CENTERING_METHOD_VERSION if args.centering else None,
-                "algorithm_configuration": _centering_algorithm_configuration(args),
-                "relion_origins_used": False,
-                "orientation_angles_used": False,
-                "reference_map_used": False,
-            },
         },
         "selection": {
             "n_images": args.n_select,
             "neighbor_distance_fraction": args.neighbor_distance_fraction,
-            "neighbor_distance_coordinate_pixels": (
-                args.neighbor_distance_coordinate_pixels),
-            "neighbor_distance_mode": (
-                "explicit RELION-coordinate pixels"
-                if args.neighbor_distance_coordinate_pixels is not None else
-                "fraction of native particle-box side"),
-            "maximum_score_quantile": args.max_score_quantile,
             "preview_images": args.n_preview,
         },
         "moments": {
             "resolution": args.moment_res,
-            "basis": "fourier_bessel",
-            "compression": "in-plane-invariant steerable FB blocks",
-            "dc_handling": "retained",
-            "available_orders": [1, 2, 3],
-            "n_canonical_m3_entries": args.expected_m3_entries,
-            "max_m3_entries": args.max_m3_entries,
         },
         "model": {
-            "volume_representation": "spherical Fourier-Bessel",
             "ell_max": args.ell_max,
-            "viewing_representation": "positive full-real-SH SOS density",
             "viewing_degree": args.viewing_degree,
-            "sphere_node_request": args.sphere_nodes,
-            "sphere_degree_request": args.sphere_degree,
-            "n_inplane": 1,
-            "shift_sigma": 0.0,
+            "symmetry": args.symmetry,
         },
         "optimization": {
-            "n_initializations": args.n_init,
-            "maxiter": args.maxiter,
+            "n_initializations": N_INIT,
+            "maxiter": MAXITER,
+            "m3_maxiter": M3_MAXITER,
             "seed": args.seed,
-            "orders_fit_independently": True,
-            "m3_initialization": "M2 init_i warm-starts M3 init_i",
-            "result_selection": "minimum normalized active-moment loss",
+            "shift_distribution": _shift_settings(args, args.moment_res),
         },
     }
 
@@ -337,14 +177,11 @@ def _denoise_command(args, paths):
         "--batch-size", str(args.batch_size), "--workers", str(args.workers),
         "--device", args.device,
         "--background-radius", str(args.background_radius),
-        *(["--denoise-max-order", str(args.denoise_max_order)] if args.denoise_max_order is not None else []),
+        "--denoise-max-order", str(args.denoise_max_order),
         "--ctf-mean-defocus-bin", str(args.ctf_mean_defocus_bin),
         "--flip-sign" if args.flip_sign else "--no-flip-sign",
-        "--do-global-centering" if args.centering else "--no-do-global-centering",
         "--outdir", str(paths["denoising"]),
     ]
-    if args.centering:
-        command.extend(["--centering-output-dir", str(paths["centering"])])
     if args.data_folder is not None:
         command.extend(["--datadir", str(args.data_folder.expanduser().resolve())])
     if args.stack_prefix is not None:
@@ -354,22 +191,17 @@ def _denoise_command(args, paths):
     return command
 
 
-def _selection_command(args, paths):
+def _selection_command(args, paths, auto=True):
+    """The select command: the first pass takes the tightest score ceiling that leaves ``n_select`` particles, the second keeps them all."""
     command = [
         sys.executable, "-u", "-m", "kam.command_line", "select",
         "--denoising-dir", str(paths["denoising"]),
         "--n-select", str(args.n_select), "--n-preview", str(args.n_preview),
         "--seed", str(args.seed), "--batch-size", str(args.batch_size),
-        "--max-score-quantile", str(args.max_score_quantile),
+        *(["--auto-score-quantile"] if auto else ["--max-score-quantile", "1.0", "--no-auto-score-quantile"]),
         "--outdir", str(paths["selection"]),
+        "--neighbor-distance-fraction", str(args.neighbor_distance_fraction),
     ]
-    if args.neighbor_distance_coordinate_pixels is None:
-        command.extend([
-            "--neighbor-distance-fraction", str(args.neighbor_distance_fraction)])
-    else:
-        command.extend([
-            "--neighbor-distance-coordinate-pixels",
-            str(args.neighbor_distance_coordinate_pixels)])
     return command
 
 
@@ -390,41 +222,44 @@ def _report_value(value):
     raise TypeError(f"unsupported hyperparameter report value: {value!r}")
 
 
+def _resolved_stage_settings(args, paths, auto=True):
+    """The settings the denoise and select stages run with, the defaults of their own parsers included."""
+    command = _denoise_command(args, paths)
+    denoise = FastCWFDenoiseConfig(**vars(_denoise_parse_args(command[command.index("denoise") + 1:])))
+    command = _selection_command(args, paths, auto)
+    selection = _selection_parser().parse_args(command[command.index("select") + 1:])
+    return asdict(denoise), vars(selection)
+
+
 def _hyperparameters(args: argparse.Namespace, paths: dict[str, Path]) -> dict:
     """Record CLI values and resolved stage defaults before processing data."""
-    from dataclasses import asdict
-
-    denoise_command = _denoise_command(args, paths)
-    denoise_arguments = _denoise_parse_args(
-        denoise_command[denoise_command.index("denoise") + 1:])
-    denoise_config = FastCWFDenoiseConfig(
-        **vars(denoise_arguments), driver_path=_THIS_FILE)
-    selection_command = _selection_command(args, paths)
-    selection = _selection_parser().parse_args(
-        selection_command[selection_command.index("select") + 1:])
-    moment_config = postprocessing.MomentPreparationConfig(
-        denoising_dir=paths["denoising"],
-        selection_file=paths["selection"] / "selection.npz",
+    denoise, selection = _resolved_stage_settings(args, paths)
+    stages = {"denoise": denoise, "selection": selection}
+    stages["redenoise"], stages["reselect"] = _resolved_stage_settings(*_second_pass(args, paths), auto=False)
+    final = paths["redenoised"]
+    stages["moment_preparation"] = asdict(postprocessing.MomentPreparationConfig(
+        denoising_dir=final,
+        selection_file=final / "selection.npz",
         output_dir=paths["prepared"],
-        expected_dataset=_dataset_label(args), n_images=args.n_select,
+        n_images=args.n_select,
         denoise_res=args.denoise_res, moment_res=args.moment_res,
-        batch_size=args.batch_size, device=args.device,
-        max_m3_entries=args.max_m3_entries, fb_ell_max=args.ell_max,
-        augment_reflections=args.augment_reflections,
-    )
-    reconstruction = {
-        f"M{order}": asdict(ReconstructionConfig(
+        batch_size=args.batch_size, device=args.device, fb_ell_max=args.ell_max,
+    ))
+    for order in (1, 2, 3):
+        stages[f"M{order}"] = asdict(ReconstructionConfig(
             prepared_dir=paths["prepared"], output_dir=paths[f"m{order}"],
             order=order, ell_max=args.ell_max,
-            viewing_degree=args.viewing_degree, sphere_nodes=args.sphere_nodes,
-            sphere_degree=args.sphere_degree,
-            n_init=args.n_init,
-            maxiter=args.maxiter,
+            viewing_degree=args.viewing_degree,
+            symmetry=args.symmetry,
+            n_init=1 if order == 3 else N_INIT,
+            maxiter=_maxiter(order),
             device=args.device, seed=args.seed, resume=args.resume,
-            initial_fit=paths[f"m{order - 1}"] if order > 1 else None,
+            initial_fit=_initial_fit(paths, order),
         ))
-        for order in (1, 2, 3)
-    }
+        if order == 2:
+            stages["M2_selection"] = {"m2_dir": str(paths["m2"]), "output_dir": str(paths["m2_selected"]),
+                                      "rule": "minimum M3 residual of the M2 solutions, before M3 fitting"}
+    stages["shift_distribution"] = _shift_settings(args, args.moment_res)
     environment_names = (
         "SLURM_JOB_ID", "SLURM_JOB_NAME", "SLURM_JOB_NODELIST", "SLURM_NTASKS",
         "SLURM_CPUS_PER_TASK", "SLURM_CPUS_ON_NODE", "SLURM_GPUS_ON_NODE",
@@ -432,7 +267,6 @@ def _hyperparameters(args: argparse.Namespace, paths: dict[str, Path]) -> dict:
         "MKL_NUM_THREADS",
     )
     return _report_value({
-        "schema_version": 1,
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "arguments": {
             {"star_path": "particles", "data_folder": "datadir",
@@ -440,13 +274,7 @@ def _hyperparameters(args: argparse.Namespace, paths: dict[str, Path]) -> dict:
             for key, value in vars(args).items()
         },
         "configuration": _configuration(args),
-        "resolved_stage_configs": {
-            "denoise": asdict(denoise_config),
-            "centering": _centering_algorithm_configuration(args),
-            "selection": vars(selection),
-            "moment_preparation": asdict(moment_config),
-            **reconstruction,
-        },
+        "resolved_stage_configs": stages,
         "output_paths": paths,
         "runtime": {
             "python_executable": sys.executable,
@@ -459,7 +287,6 @@ def _hyperparameters(args: argparse.Namespace, paths: dict[str, Path]) -> dict:
             "environment": {name: os.environ[name] for name in environment_names
                             if name in os.environ},
         },
-        "implementation": _implementation_fingerprint(),
     })
 
 
@@ -475,23 +302,22 @@ def _paths(args: argparse.Namespace) -> dict[str, Path]:
         "hyperparameters": root / "hyperparameters.json",
         "log": root / "run.log",
         "timing_report": root / "timing_report.json",
-        "centering": root / "centering",
         "denoising": root / "denoise",
         "selection": root / "denoise",
+        "redenoised": root / "MoM" / "denoised_selected" / "denoise",
         "prepared": root / "MoM" / "prepared",
         "m1": root / "MoM" / "M1",
         "m2": root / "MoM" / "M2",
+        "m2_selected": root / "MoM" / "M2_selected",
         "m3": root / "MoM" / "M3",
     }
 
 
 def _ensure_manifest(args: argparse.Namespace, paths: dict[str, Path]) -> None:
-    configuration = _configuration(args)
+    """Create pipeline_config.json in a fresh output directory; an existing one is left as it is."""
     manifest_path = paths["manifest"]
     paths["root"].mkdir(parents=True, exist_ok=True)
     if manifest_path.exists():
-        previous = _read_json(manifest_path)
-        _validate_pipeline_manifest(previous, configuration)
         return
     # Slurm creates stdout/stderr before the payload starts.  Keeping those
     # logs in the MoM directory must not make a fresh pipeline look like an
@@ -509,21 +335,12 @@ def _ensure_manifest(args: argparse.Namespace, paths: dict[str, Path]) -> None:
         raise FileExistsError(
             f"output directory is nonempty but has no pipeline manifest: "
             f"{paths['root']}")
-    value = {
+    dirty = subprocess.run(["git", "-C", str(ROOT), "status", "--porcelain", "--", "src"], capture_output=True, text=True)
+    _write_json_exclusive(manifest_path, {
         "created_utc": datetime.now(timezone.utc).isoformat(),
-        "configuration": configuration,
-        "implementation": _implementation_fingerprint(),
-    }
-    try:
-        _write_json_exclusive(manifest_path, value)
-    except FileExistsError:
-        previous = _read_json(manifest_path)
-        try:
-            _validate_pipeline_manifest(previous, configuration)
-        except ValueError as error:
-            raise ValueError(
-                "a concurrent invocation created an incompatible manifest") \
-                from error
+        "code": {"commit": git_commit(ROOT), "uncommitted_changes": bool(dirty.stdout.strip())},
+        "configuration": _configuration(args),
+    })
 
 
 def _run(command: list[str], *, dry_run: bool) -> None:
@@ -535,671 +352,314 @@ def _run(command: list[str], *, dry_run: bool) -> None:
     subprocess.run(command, check=True, cwd=ROOT, env=environment)
 
 
-def _denoising_complete(path: Path, args: argparse.Namespace) -> bool:
-    report_path = path / "report.json"
-    manifest_path = path / "manifest.npz"
-    stack_path = path / "denoised_images.mrcs"
-    if not all(item.is_file() for item in (
-            report_path, manifest_path, stack_path,
-            path / "denoising_preview.pdf")):
-        return False
-    report = _read_json(report_path)
-    _validate_optional_timing(report, "completed denoising stage")
-    _validate_recorded_implementation(
-        report.get("implementation"), "completed denoising stage")
-    expected_backend = (
-        "cupy_cufinufft_fle" if args.device == "gpu"
-        else "numpy_scipy_finufft_fle")
-    if (report.get("dataset") != _dataset_label(args)
-            or int(report.get("denoise_res", -1)) != args.denoise_res
-            or report.get("device") != args.device
-            or report.get("fastpca_backend") != expected_backend
-            or report.get("fle_precision") != "single"
-            or report.get("fle_max_order") != args.denoise_max_order
-            or bool(report.get("flip_sign")) != args.flip_sign
-            or int(report.get("n_images", -1)) != int(report.get("n_total", -2))
-            or report.get("sampling") != "all_STAR_rows"
-            or not math.isclose(
-                float(report.get("ctf_mean_defocus_bin_angstrom", math.nan)),
-                args.ctf_mean_defocus_bin, rel_tol=0.0, abs_tol=1e-12)):
-        raise ValueError("completed denoising output does not match pipeline config")
-    with np.load(manifest_path, allow_pickle=False) as saved:
-        count = int(np.asarray(saved["n_images"]).reshape(()))
-        side = int(np.asarray(saved["denoise_res"]).reshape(()))
-        stack_size = int(np.asarray(saved["stack_size"]).reshape(()))
-        stack_mtime_ns = int(
-            np.asarray(saved["stack_mtime_ns"]).reshape(()))
-        manifest_device = str(
-            np.asarray(saved["device"]).reshape(()).item())
-        manifest_backend = str(
-            np.asarray(saved["fastpca_backend"]).reshape(()).item())
-        manifest_precision = str(
-            np.asarray(saved["fle_precision"]).reshape(()).item())
-        _validate_denoising_centering(report, saved, args)
-    if count != int(report["n_images"]) or side != args.denoise_res:
-        raise ValueError("denoising report and manifest disagree")
-    if (manifest_device != args.device
-            or manifest_backend != expected_backend
-            or manifest_precision != "single"):
-        raise ValueError(
-            "denoising manifest has a different backend or precision")
-    stack_stat = stack_path.stat()
-    if (stack_stat.st_size != stack_size
-            or stack_stat.st_mtime_ns != stack_mtime_ns):
-        raise ValueError("denoised image stack changed after its manifest")
-    if args.centering:
-        _ensure_centering_diagnostic(path, report)
-    return stack_stat.st_size > 0
-
-
-def _ensure_centering_diagnostic(denoising_path, denoising_report):
-    """Validate centering provenance and restore missing diagnostic PDFs.
-
-    A restored before/after preview marks the pre-translation estimated-center
-    coordinate in both rows, matching newly generated diagnostics.
-    """
-    directory = denoising_path.parent / "centering"
-    expected = {
-        "directory": str(directory),
-        "preview": str(directory / "before_after.pdf"),
-        "preview_cache": str(directory / "preview.npz"),
-        "report": str(directory / "report.json"),
-        "estimates": str(directory / "estimates.npz"),
-    }
-    if denoising_report.get("centering_diagnostic") != expected:
-        raise ValueError("denoising lacks its separate centering diagnostics")
-    if not all(Path(expected[key]).is_file() for key in ("preview_cache", "report", "estimates")):
-        raise FileNotFoundError(f"centering preview cache or report is missing: {directory}")
-    report = _read_json(Path(expected["report"]))
-    n_images = int(denoising_report["n_images"])
-    if (report.get("n_images_centered") != n_images
-            or report.get("all_images_entering_covariance_centered") is not True
-            or report.get("recentering") != denoising_report.get("recentering")):
-        raise ValueError("centering diagnostics disagree with the denoising provenance")
-    preview_path = Path(expected["preview"])
-    preview_semantics_changed = (
-        report.get("preview_marker_semantics")
-        != CENTERING_PREVIEW_MARKER_SEMANTICS
-    )
-    if not preview_path.is_file() or preview_semantics_changed:
-        with np.load(expected["preview_cache"], allow_pickle=False) as saved:
-            before = np.asarray(saved["before"])
-            after = np.asarray(saved["after"])
-            cached_centers = (
-                np.asarray(saved["estimated_centers_yx_denoise_pixels"])
-                if "estimated_centers_yx_denoise_pixels" in saved.files else None
-            )
-            side = int(denoising_report["denoise_res"])
-            if before.shape != (min(8, n_images), side, side):
-                raise ValueError("centering preview cache has an unexpected image shape")
-        if cached_centers is None:
-            with np.load(denoising_path / "manifest.npz", allow_pickle=False) as saved:
-                cached_centers = (
-                    side // 2 - np.asarray(saved["applied_shifts_xy_denoise_pixels"])[:len(before), ::-1])
-        save_centering_preview(
-            before, after, preview_path,
-            estimated_centers_yx=cached_centers,
-        )
-        if preview_semantics_changed:
-            report["preview_description"] = CENTERING_PREVIEW_DESCRIPTION
-            report["preview_marker_semantics"] = CENTERING_PREVIEW_MARKER_SEMANTICS
-            _write_json_atomic(Path(expected["report"]), report)
-        action = "updated" if preview_semantics_changed else "restored"
-        print(f"[pipeline] {action} centering preview: {preview_path}", flush=True)
-
-
-def _validate_denoising_centering(report, saved, args) -> None:
-    """Never reuse a stack with different centering or pose provenance."""
-    expected_method = CENTERING_METHOD if args.centering else "none"
-    for key in ("relion_poses_used", "relion_orientation_angles_used",
-                "relion_origins_used", "recenter_from_star", "reference_used"):
-        if (report.get(key) is not False or key not in saved
-                or np.asarray(saved[key]).shape != ()
-                or np.asarray(saved[key]).dtype.kind != "b"
-                or bool(saved[key])):
-            raise ValueError(
-                f"completed denoising has missing or incompatible provenance: {key}")
-    if (report.get("image_centering_enabled") is not args.centering
-            or report.get("centering_method") != expected_method):
-        raise ValueError("completed denoising used different centering settings")
-    expected_manifest = {
-        "image_centering_enabled": args.centering,
-        "centering_method": expected_method,
-    }
-    if args.centering:
-        expected_manifest["centering_method_version"] = CENTERING_METHOD_VERSION
-        if report.get("centering_method_version") != CENTERING_METHOD_VERSION:
-            raise ValueError("completed denoising used an older centering algorithm")
-        if report["implementation"].get("centering") != _code_identity(
-                PACKAGE_DIR / "centering.py"):
-            raise ValueError("completed denoising lacks the current centering implementation")
-    for key, expected in expected_manifest.items():
-        if (key not in saved or np.asarray(saved[key]).shape != ()
-                or np.asarray(saved[key]).item() != expected):
-            raise ValueError(f"denoising manifest has different centering metadata: {key}")
-    recentering = report.get("recentering")
-    if (not isinstance(recentering, dict)
-            or recentering.get("method") != expected_method
-            or recentering.get("enabled") is not args.centering
-            or any(recentering.get(key) is not False for key in (
-                "orientation_angles_used", "relion_origins_used", "reference_map_used"))):
-        raise ValueError("completed denoising has incompatible centering provenance")
-    if args.centering:
-        algorithm = recentering.get("algorithm")
-        if (not isinstance(algorithm, dict)
-                or algorithm.get("configuration") != _centering_algorithm_configuration(args)):
-            raise ValueError("completed denoising used different dataset-centering defaults")
-    if "recentering" not in saved:
-        raise ValueError("denoising manifest lacks centering provenance")
-    try:
-        manifest_recentering = json.loads(np.asarray(saved["recentering"]).item())
-    except (TypeError, ValueError) as error:
-        raise ValueError("denoising manifest has invalid centering provenance") from error
-    if manifest_recentering != recentering:
-        raise ValueError("denoising report and manifest disagree on centering provenance")
-    if args.centering:
-        count = int(report["n_images"])
-        key = "applied_shifts_xy_denoise_pixels"
-        if (key not in saved or np.asarray(saved[key]).shape != (count, 2)
-                or not np.all(np.isfinite(saved[key]))):
-            raise ValueError(f"denoising manifest has invalid centering coordinates: {key}")
-        shifts = np.asarray(saved[key])
-        if not np.allclose(shifts, shifts[:1], rtol=0, atol=1e-9):
-            raise ValueError("denoising manifest applied different shifts to different images; "
-                             "only a common shift is supported")
-
-
-def _selection_complete(path: Path, args: argparse.Namespace) -> bool:
-    report_path = path / "selection_report.json"
-    archive = path / "selection.npz"
-    diagnostic_pdf = path / "selection_diagnostic.pdf"
-    if (not report_path.is_file() or not archive.is_file()
-            or not diagnostic_pdf.is_file()
-            or not (path / "selection_scores.pdf").is_file()):
-        return False
-    report = _read_json(report_path)
-    _validate_optional_timing(report, "completed selection stage")
-    provenance = report.get("provenance")
-    if not isinstance(provenance, dict):
-        raise ValueError("completed selection lacks implementation provenance")
-    expected_selection_hashes = {
-        "selector_sha256": _sha256(_THIS_FILE),
-        "selection_module_sha256": _sha256(
-            PACKAGE_DIR / "preprocessing.py"),
-    }
-    for key, expected in expected_selection_hashes.items():
-        if provenance.get(key) != expected:
-            raise ValueError(
-                f"completed selection implementation changed: {key}")
-    denoising_manifest = path / "manifest.npz"
-    if (not denoising_manifest.is_file()
-            or report.get("input_manifest_sha256")
-            != _sha256(denoising_manifest)):
-        raise ValueError(
-            "completed selection does not match the current denoising manifest")
-    if report.get("selection_sha256") != _sha256(archive):
-        raise ValueError("completed selection archive changed after its report")
-    if (int(report.get("n_selected", -1)) != args.n_select
-            or report.get("dataset") != _dataset_label(args)
-            or bool(report.get("uses_reference_map", True))
-            or bool(report.get("uses_relion_poses_for_selection", True))):
-        raise ValueError("completed selection does not match pipeline config")
-    if args.neighbor_distance_coordinate_pixels is not None:
-        distance_matches = math.isclose(
-            float(report.get(
-                "minimum_neighbor_distance_coordinate_pixels", math.nan)),
-            args.neighbor_distance_coordinate_pixels,
-            rel_tol=0.0, abs_tol=1e-12)
-    else:
-        distance_matches = math.isclose(
-            float(report.get(
-                "minimum_neighbor_distance_fraction_of_native_box",
-                math.nan)),
-            args.neighbor_distance_fraction, rel_tol=0.0, abs_tol=1e-12)
-    score_matches = math.isclose(
-        float(report.get("maximum_crowding_score_quantile", math.nan)),
-        args.max_score_quantile, rel_tol=0.0, abs_tol=1e-12)
-    if not distance_matches or not score_matches:
-        raise ValueError("completed selection has different selection thresholds")
-    with np.load(archive, allow_pickle=False) as saved:
-        positions = np.asarray(saved["selected_positions"])
-        diagnostic_positions = np.asarray(
-            saved["diagnostic_positions"], dtype=np.int64)
-        diagnostic_selected = np.asarray(
-            saved["diagnostic_selected"], dtype=bool)
-    if positions.shape != (args.n_select,) or len(np.unique(positions)) != len(positions):
-        raise ValueError("selection archive has invalid particle identities")
-    if (diagnostic_positions.shape != (args.n_preview,)
-            or diagnostic_selected.shape != (args.n_preview,)
-            or len(np.unique(diagnostic_positions)) != args.n_preview):
-        raise ValueError("selection archive has an invalid random diagnostic")
-    if not np.array_equal(
-            diagnostic_selected, np.isin(diagnostic_positions, positions)):
-        raise ValueError("selection diagnostic labels disagree with selected particles")
-    diagnostic_report = report.get("selection_diagnostic")
-    if (not isinstance(diagnostic_report, dict)
-            or int(diagnostic_report.get("n_images", -1)) != args.n_preview
-            or int(diagnostic_report.get("n_selected", -1))
-            != int(np.sum(diagnostic_selected))
-            or int(diagnostic_report.get("n_not_selected", -1))
-            != int(np.sum(~diagnostic_selected))
-            or diagnostic_report.get("sampling")
-            != "uniform_without_replacement_from_all_denoised_images"
-            or diagnostic_report.get("seed_sequence")
-            != [args.seed, 0x53454C]
-            or diagnostic_report.get("pdf_sha256") != _sha256(diagnostic_pdf)):
-        raise ValueError("selection report has an invalid random diagnostic")
-    return True
-
-
-def _prepared_complete(path: Path, args: argparse.Namespace) -> bool:
-    report_path = path / "report.json"
-    archive = path / "moments.npz"
-    if not report_path.is_file() or not archive.is_file():
-        return False
-    report = _read_json(report_path)
-    _validate_optional_timing(report, "completed moment-preparation stage")
-    if report.get("implementation") != \
-            _reconstruction_implementation_fingerprint():
-        raise ValueError(
-            "moment-preparation implementation differs from its report")
-    denoising_manifest = path.parents[1] / "denoise" / "manifest.npz"
-    selection_archive = path.parents[1] / "denoise" / "selection.npz"
-    if (not denoising_manifest.is_file()
-            or report.get("denoising_manifest_sha256")
-            != _sha256(denoising_manifest)):
-        raise ValueError(
-            "prepared moments do not match the current denoising manifest")
-    if (not selection_archive.is_file()
-            or report.get("selection_sha256") != _sha256(selection_archive)):
-        raise ValueError(
-            "prepared moments do not match the current particle selection")
-    if report.get("prepared_sha256") != _sha256(archive):
-        raise ValueError("prepared moment archive changed after its report")
-    report_moment_res = report.get("moment_res", report.get("side", -1))
-    report_basis = report.get("moment_basis")
-    if (int(report.get("n_images", -1)) != args.n_select
-            or int(report_moment_res) != args.moment_res
-            or report.get("dataset") != _dataset_label(args)
-            or report_basis != "fb"
-            or report.get("fb_ell_max") != args.ell_max
-            or bool(report.get("augment_reflections", False))
-            is not args.augment_reflections):
-        raise ValueError("prepared moments do not match pipeline config")
-    with np.load(archive, allow_pickle=False) as saved:
-        if (int(np.asarray(saved["n_images"]).reshape(())) != args.n_select
-                or int(np.asarray(saved["ds_res"]).reshape(())) != args.moment_res):
-            raise ValueError("prepared report and moment archive disagree")
-    return True
-
-
-def _fit_complete(path: Path, args: argparse.Namespace, order: int) -> bool:
-    summary_path = path / "summary.json"
-    fit_path = path / "fit.npz"
-    if not all(item.is_file() for item in (
-            summary_path, fit_path, path / "config.json", path / "recon.mrc")):
-        return False
-    summary = _read_json(summary_path)
-    _validate_optional_timing(summary, f"completed M{order} reconstruction")
-    if not summary.get("complete", False):
-        return False
-    if summary.get("implementation") != \
-            _reconstruction_implementation_fingerprint():
-        raise ValueError(
-            f"completed M{order} implementation differs from its summary")
-    prepared_archive = path.parent / "prepared" / "moments.npz"
-    if (not prepared_archive.is_file()
-            or summary.get("prepared_sha256") != _sha256(prepared_archive)):
-        raise ValueError(
-            f"completed M{order} fit does not match the current moments")
-    expected = {
-        "order": order,
-        "ell_max": args.ell_max,
-        "viewing_degree": args.viewing_degree,
-        "sphere_node_request": args.sphere_nodes,
-        "sphere_degree_request": args.sphere_degree,
-        "inplane_angles": 1,
-        "n_initializations": args.n_init,
-        "maxiter": args.maxiter,
-        "initialization_seed": args.seed,
-        "initial_fit": (str((path.parent / f"M{order - 1}").resolve())
-                        if order > 1 else None),
-    }
-    mismatch = {key: (summary.get(key), value) for key, value in expected.items()
-                if summary.get(key) != value}
-    if mismatch:
-        raise ValueError(f"completed M{order} fit has different config: {mismatch}")
-    if order > 1:
-        warm_files = summary.get("initial_fit_files")
-        warm_hashes = summary.get("initial_fit_sha256")
-        if (not isinstance(warm_files, list)
-                or len(warm_files) != args.n_init
-                or not isinstance(warm_hashes, list)
-                or len(warm_hashes) != args.n_init
-                or not summary.get("m3_warm_start_semantics")):
-            raise ValueError(
-                f"completed M{order} fit lacks one audited M{order - 1} "
-                "warm start per init")
-        for filename, expected_hash in zip(warm_files, warm_hashes):
-            warm_path = Path(filename)
-            if (not warm_path.is_file()
-                    or _sha256(warm_path) != expected_hash):
-                raise ValueError(
-                    f"completed M{order} fit has a changed or missing "
-                    f"M{order - 1} warm start")
-    records = summary.get("fits")
-    if not isinstance(records, list) or len(records) != args.n_init:
-        raise ValueError(f"completed M{order} fit has an invalid start table")
-    objectives = np.asarray([record["objective"] for record in records], dtype=float)
-    if not np.all(np.isfinite(objectives)):
-        raise ValueError(f"completed M{order} fit contains nonfinite losses")
-    best_position = int(np.argmin(objectives))
-    best_index = int(records[best_position]["init_index"])
-    if int(summary.get("best_init_by_loss", -1)) != best_index:
-        raise ValueError(f"M{order} result was not selected by minimum moment loss")
-    with np.load(fit_path, allow_pickle=False) as saved:
-        saved_objective = float(np.asarray(saved["objective"]).reshape(()))
-    if not math.isclose(saved_objective, float(objectives[best_position]),
-                        rel_tol=1e-11, abs_tol=1e-14):
-        raise ValueError(f"top-level M{order} fit is not the minimum-loss start")
-    best_fit = path / f"init_{best_index}" / "fit.npz"
-    if not best_fit.is_file() or _sha256(best_fit) != _sha256(fit_path):
-        raise ValueError(
-            f"top-level M{order} fit is not the archived minimum-loss fit")
-    return True
-
-
 def _nonempty(path: Path) -> bool:
     return path.exists() and any(path.iterdir())
 
 
+# A stage is complete when the pipeline has marked its report: ``pipeline_stage`` holds the configuration the stage was made with.
+_STAGE_REPORTS = {
+    "denoise": ("denoising", "report.json"),
+    "select": ("selection", "selection_report.json"),
+    "prepare": ("prepared", "report.json"),
+    "m1": ("m1", "summary.json"),
+    "m2": ("m2", "summary.json"),
+    "m2_select": ("m2_selected", "selection.json"),
+    "m3": ("m3", "summary.json"),
+}
+
+
 def _stage_report_path(paths: dict[str, Path], name: str) -> Path:
-    if name == "denoise":
-        return paths["denoising"] / "report.json"
-    if name == "select":
-        return paths["selection"] / "selection_report.json"
-    if name == "prepare":
-        return paths["prepared"] / "report.json"
-    if name in {"m1", "m2", "m3"}:
-        return paths[name] / "summary.json"
-    raise ValueError(f"unknown pipeline stage {name!r}")
+    directory, filename = _STAGE_REPORTS[name]
+    return paths[directory] / filename
 
 
-def _stage_complete(name: str, paths: dict[str, Path],
-                    args: argparse.Namespace) -> bool:
-    if name == "denoise":
-        return _denoising_complete(paths["denoising"], args)
-    if name == "select":
-        return _selection_complete(paths["selection"], args)
-    if name == "prepare":
-        return _prepared_complete(paths["prepared"], args)
-    if name in {"m1", "m2", "m3"}:
-        return _fit_complete(paths[name], args, int(name[1]))
-    raise ValueError(f"unknown pipeline stage {name!r}")
+def _stage_complete(report_path: Path, configuration: dict) -> bool:
+    """True if the stage finished; a stage that finished with another configuration is an error."""
+    if not report_path.is_file():
+        return False
+    stage = _read_json(report_path).get("pipeline_stage")
+    if stage is None:
+        return False
+    if stage["configuration"] != configuration:
+        raise ValueError(
+            f"{report_path} was made with a different configuration; "
+            "use the original arguments or a new output directory")
+    return True
 
 
-def _annotate_new_stage_timing(
-        report_path: Path, observed_elapsed: float,
-        started_utc: str, finished_utc: str) -> None:
-    """Complete and validate timing metadata for a newly finished stage."""
+def _finish_stage(report_path: Path, configuration: dict) -> None:
+    """Mark the stage complete in its report and record the configuration it was made with."""
     record = _read_json(report_path)
-    record.setdefault("elapsed_seconds", float(observed_elapsed))
-    record.setdefault(
-        "timings_seconds", {"total": float(record["elapsed_seconds"])})
-    record["pipeline_observed_elapsed_seconds"] = float(observed_elapsed)
-    record["pipeline_stage_started_utc"] = started_utc
-    record["pipeline_stage_finished_utc"] = finished_utc
-    _validate_optional_timing(record, str(report_path))
+    record["pipeline_stage"] = {
+        "configuration": configuration,
+        "finished_utc": datetime.now(timezone.utc).isoformat(),
+    }
     _write_json_atomic(report_path, record)
 
 
+def _run_stage(name: str, report_path: Path, configuration: dict, args: argparse.Namespace, execute, *,
+               existing: bool, resumable: bool = False) -> str:
+    """Skip a complete stage, refuse to overwrite an incomplete one, otherwise execute and mark it complete.
+
+    ``existing`` tells whether the stage already has output; ``resumable`` lets ``execute`` continue it."""
+    if _stage_complete(report_path, configuration):
+        if not args.resume:
+            raise FileExistsError(f"{name} output already exists: {report_path.parent}")
+        print(f"[pipeline] {name}: complete, skipping", flush=True)
+        return "skipped_completed"
+    if existing and not resumable:
+        raise RuntimeError(
+            f"{name} output is incomplete and will not be overwritten: {report_path.parent}. "
+            "Inspect it, then use a new output directory or remove only that "
+            "incomplete stage yourself.")
+    execute()
+    if not args.dry_run:
+        _finish_stage(report_path, configuration)
+    return "resumed_and_completed" if existing else "completed_this_invocation"
+
+
+def _second_pass(args: argparse.Namespace, paths: dict[str, Path]):
+    """Arguments and paths of the re-denoising pass on the selected particles only.
+
+    Its outputs live in ``MoM/denoised_selected/denoise`` (the input of the moments), next to the STAR of
+    the selected particles; the top-level ``denoise/`` keeps the first pass."""
+    import copy
+
+    folder = paths["redenoised"]
+    second = copy.copy(args)
+    second.star_path = folder.parent / "selected_particles.star"
+    if args.data_folder is None:          # relative stack paths are relative to the STAR of the first pass
+        second.data_folder = args.star_path.expanduser().resolve().parent
+    second_paths = dict(paths, denoising=folder, selection=folder)
+    return second, second_paths
+
+
+def _denoise(args: argparse.Namespace, paths: dict[str, Path], configuration: dict) -> str:
+    return _run_stage(
+        "denoising", _stage_report_path(paths, "denoise"), configuration, args,
+        lambda: _run(_denoise_command(args, paths), dry_run=args.dry_run),
+        existing=_nonempty(paths["denoising"]))
+
+
+def _select(args: argparse.Namespace, paths: dict[str, Path], configuration: dict, auto: bool = True) -> str:
+    return _run_stage(
+        "selection", _stage_report_path(paths, "select"), configuration, args,
+        lambda: _run(_selection_command(args, paths, auto), dry_run=args.dry_run),
+        existing=any((paths["selection"] / name).exists() for name in SELECTION_OUTPUT_NAMES))
+
+
+def _redenoise(args: argparse.Namespace, paths: dict[str, Path], configuration: dict) -> str:
+    """Denoise the selected particles again: their own mean, covariance and noise estimates."""
+    second, second_paths = _second_pass(args, paths)
+    if not args.dry_run and not second.star_path.is_file():
+        with np.load(paths["selection"] / "selection.npz", allow_pickle=False) as saved:
+            rows = np.sort(np.asarray(saved["selected_source_rows"], dtype=np.int64))
+        _write_selected_star(args.star_path.expanduser().resolve(), rows, second.star_path)
+    return _denoise(second, second_paths, configuration)
+
+
+def _reselect(args: argparse.Namespace, paths: dict[str, Path], configuration: dict) -> str:
+    """Select on the re-denoised particles (all of them stay selected); their sample montage is copied to the first pass."""
+    second, second_paths = _second_pass(args, paths)
+    status = _select(second, second_paths, configuration, auto=False)
+    if not args.dry_run:
+        shutil.copy2(second_paths["selection"] / "selection_selected_sample.pdf",
+                     paths["selection"] / "selection_selected_sample.pdf")
+    return status
+
+
+def _prepare(args: argparse.Namespace, paths: dict[str, Path], configuration: dict) -> str:
+    """Form the moments from the selected particles of ``paths['denoising']``."""
+    def execute():
+        print("[pipeline] prepare_moments(denoising={!s}, selection={!s}, output={!s}, n_images={}, denoise_res={}, "
+              "moment_res={}, fb_ell_max={})".format(
+                  paths["denoising"], paths["selection"] / "selection.npz", paths["prepared"], args.n_select,
+                  args.denoise_res, args.moment_res, args.ell_max), flush=True)
+        if not args.dry_run:
+            postprocessing.prepare_moments(postprocessing.MomentPreparationConfig(
+                denoising_dir=paths["denoising"],
+                selection_file=paths["selection"] / "selection.npz",
+                output_dir=paths["prepared"],
+                n_images=args.n_select,
+                denoise_res=args.denoise_res, moment_res=args.moment_res,
+                batch_size=args.batch_size, device=args.device, fb_ell_max=args.ell_max,
+            ))
+
+    return _run_stage("moment preparation", _stage_report_path(paths, "prepare"), configuration, args, execute,
+                      existing=_nonempty(paths["prepared"]))
+
+
+def _shift_settings(args: argparse.Namespace, side: int) -> dict:
+    """Ring grid of the shift distribution (pixels of the ``side``-pixel moment grid)."""
+    return dict(step_px=args.shift_step_px,
+                max_px=side / 8 if args.shift_max_px is None else args.shift_max_px)
+
+
+def _reconstruct_order(config: ReconstructionConfig, shift: dict):
+    """Fit one moment order; the ring shift distribution of ``shift`` is fitted jointly and saved in ``shift_distribution.json``.
+
+    Initialization i starts from the shift law of initialization i of ``config.initial_fit``. The laws of the initializations that
+    finished before an interruption are kept (the finished initializations are a prefix) and the next fit is numbered after them."""
+    from . import shift_distribution
+
+    path = config.output_dir / "shift_distribution.json"
+    done = sum((config.output_dir / f"init_{i}" / "summary.json").is_file() for i in range(config.n_init))
+    warm = [] if config.initial_fit is None else shift_distribution.read_records(
+        config.initial_fit / "shift_distribution.json")
+    with shift_distribution.shift_law(
+            shift["step_px"], shift["max_px"], warm=[record["d"] for record in warm],
+            finished=shift_distribution.read_records(path)[:done], path=path):
+        return reconstruct_single_moment(config)
+
+
+def _maxiter(order: int) -> int:
+    """L-BFGS iteration limit of moment order ``order``: M3_MAXITER for M3, MAXITER for M1 and M2."""
+    return M3_MAXITER if order == 3 else MAXITER
+
+
+def _initial_fit(paths: dict[str, Path], order: int):
+    """The warm start of moment order ``order``: none for M1, M1 for M2, the selected M2 solution for M3."""
+    return {1: None, 2: paths["m1"], 3: paths["m2_selected"]}[order]
+
+
+def _reconstruct(args: argparse.Namespace, paths: dict[str, Path], configuration: dict, order: int) -> str:
+    output = paths[f"m{order}"]
+    initial_fit = _initial_fit(paths, order)
+    n_init = 1 if order == 3 else N_INIT
+
+    def execute():
+        print("[pipeline] reconstruct_single_moment(prepared={!s}, output={!s}, order={}, L={}, viewing_degree={}, "
+              "n_init={}, maxiter={}, initial_fit={!s})".format(
+                  paths["prepared"], output, order, args.ell_max, args.viewing_degree,
+                  n_init, _maxiter(order), initial_fit), flush=True)
+        print(f"[pipeline] shift distribution: rings every {args.shift_step_px} px up to "
+              f"{'side/8' if args.shift_max_px is None else args.shift_max_px} px (M1, M2, M3)", flush=True)
+        if not args.dry_run:
+            _reconstruct_order(ReconstructionConfig(
+                prepared_dir=paths["prepared"], output_dir=output, order=order,
+                ell_max=args.ell_max, viewing_degree=args.viewing_degree, symmetry=args.symmetry,
+                n_init=n_init, maxiter=_maxiter(order), device=args.device,
+                seed=args.seed, resume=args.resume, initial_fit=initial_fit,
+            ), _shift_settings(args, args.moment_res))
+
+    return _run_stage(f"M{order} reconstruction", _stage_report_path(paths, f"m{order}"), configuration, args, execute,
+                      existing=_nonempty(output), resumable=args.resume)
+
+
+def _select_m2(args: argparse.Namespace, paths: dict[str, Path], configuration: dict) -> str:
+    """Pick the M2 initialization whose solution best explains M3 (``shift_distribution.select_m2_start``)."""
+    from . import shift_distribution
+
+    def execute():
+        print(f"[pipeline] select_m2_start(prepared={paths['prepared']!s}, m2={paths['m2']!s}, output={paths['m2_selected']!s})", flush=True)
+        if not args.dry_run:
+            shift_distribution.select_m2_start(paths["prepared"], paths["m2"], paths["m2_selected"], ell_max=args.ell_max,
+                                               viewing_degree=args.viewing_degree, symmetry=args.symmetry, device=args.device)
+
+    return _run_stage("M2 selection", _stage_report_path(paths, "m2_select"), configuration, args, execute,
+                      existing=_nonempty(paths["m2_selected"]))
+
+
+# The sections of ``_configuration`` that determine each stage (the stage and everything upstream of it); a changed setting only
+# invalidates the stages it can affect, so M-stage settings can be varied on finished moments. The second pass depends on the selection.
+_STAGE_SECTIONS = {
+    "denoise": ("dataset_label", "inputs", "denoising"),
+    "select": ("dataset_label", "inputs", "denoising", "selection"),
+    "redenoise": ("dataset_label", "inputs", "denoising", "selection"),
+    "reselect": ("dataset_label", "inputs", "denoising", "selection"),
+    "prepare": ("dataset_label", "inputs", "denoising", "selection", "moments", "model"),
+}
+
+
+def _stages(args: argparse.Namespace, paths: dict[str, Path]) -> list:
+    """(label, report, run) of every pipeline stage in execution order; ``run`` returns how the stage ended.
+
+    Every stage is marked with the settings that determine it (``_STAGE_SECTIONS``; the M stages with all of them), so a finished
+    stage is reused only by a run configured alike."""
+    full = _configuration(args)
+
+    def configuration(label):
+        return {key: full[key] for key in _STAGE_SECTIONS.get(label, full)}
+
+    stages = [("denoise", _stage_report_path(paths, "denoise"), lambda: _denoise(args, paths, configuration("denoise"))),
+              ("select", _stage_report_path(paths, "select"), lambda: _select(args, paths, configuration("select")))]
+    final_args, final_paths = _second_pass(args, paths)
+    stages += [("redenoise", _stage_report_path(final_paths, "denoise"), lambda: _redenoise(args, paths, configuration("redenoise"))),
+               ("reselect", _stage_report_path(final_paths, "select"), lambda: _reselect(args, paths, configuration("reselect")))]
+    stages.append(("prepare", _stage_report_path(paths, "prepare"), lambda: _prepare(final_args, final_paths, configuration("prepare"))))
+    for order in (1, 2, 3):
+        if order == 3:
+            stages.append(("m2_select", _stage_report_path(paths, "m2_select"),
+                           lambda: _select_m2(args, paths, configuration("m2_select"))))
+        stages.append((f"m{order}", _stage_report_path(paths, f"m{order}"),
+                       lambda order=order: _reconstruct(args, paths, configuration(f"m{order}"), order)))
+    return stages
+
+
 def _write_timing_report(
-        args: argparse.Namespace, paths: dict[str, Path],
+        args: argparse.Namespace, paths: dict[str, Path], stages: list,
         statuses: dict[str, str], observed: dict[str, float],
         started_utc: str, finished_utc: str,
         invocation_elapsed: float) -> None:
-    """Aggregate component reports into one durable root timing report."""
-    names = ("denoise", "select", "prepare", "m1", "m2", "m3")
+    """Aggregate the stage reports into one root timing report; every invocation appends to its history."""
     stage_reports = {}
-    for name in names:
-        report_path = _stage_report_path(paths, name)
-        record = _read_json(report_path) if report_path.is_file() else None
-        if record is not None:
-            _validate_optional_timing(record, str(report_path))
-        elapsed = None if record is None else record.get("elapsed_seconds")
-        timings = None if record is None else record.get("timings_seconds")
-        stage_reports[name] = {
-            "status": statuses.get(
-                name, "available_before_invocation"
-                if record is not None else "not_available"),
+    for label, report_path, _ in stages:
+        record = _read_json(report_path)
+        stage_reports[label] = {
+            "status": statuses[label],
             "report": str(report_path),
-            "report_available": record is not None,
-            "elapsed_seconds": (
-                None if elapsed is None else float(elapsed)),
-            "timings_seconds": timings,
-            "pipeline_observed_elapsed_seconds": observed.get(name),
+            "elapsed_seconds": float(record["elapsed_seconds"]),
+            "timings_seconds": record["timings_seconds"],
+            "pipeline_observed_elapsed_seconds": observed[label],
         }
-
-    stage_elapsed = {
-        name: details["elapsed_seconds"]
-        for name, details in stage_reports.items()
-    }
-    available_elapsed = [
-        value for value in stage_elapsed.values() if value is not None]
-    requested_names = set(statuses)
-    requested_elapsed = [
-        stage_elapsed[name] for name in requested_names
-        if stage_elapsed[name] is not None]
+    stage_elapsed = {label: stage["elapsed_seconds"] for label, stage in stage_reports.items()}
     invocation = {
         "started_utc": started_utc,
         "finished_utc": finished_utc,
         "full_invocation_elapsed_seconds": float(invocation_elapsed),
-        "requested_orders": [1, 2, 3],
         "resume": bool(args.resume),
         "stage_status": dict(statuses),
         "pipeline_observed_stage_elapsed_seconds": dict(observed),
     }
-    previous_history = []
     timing_path = paths["timing_report"]
-    if timing_path.is_file():
-        previous = _read_json(timing_path)
-        history = previous.get("invocations", [])
-        if isinstance(history, list):
-            previous_history = history
+    history = _read_json(timing_path)["invocations"] if timing_path.is_file() else []
     report = {
-        "timing_report_version": 1,
         "dataset": _dataset_label(args),
         "pipeline_output": str(paths["root"]),
         "started_utc": started_utc,
         "finished_utc": finished_utc,
         "full_invocation_elapsed_seconds": float(invocation_elapsed),
         "stage_elapsed_seconds": stage_elapsed,
-        "sum_available_stage_elapsed_seconds": float(sum(available_elapsed)),
-        "sum_requested_stage_elapsed_seconds": float(sum(requested_elapsed)),
+        "sum_stage_elapsed_seconds": float(sum(stage_elapsed.values())),
         "stages": stage_reports,
-        "latest_invocation": invocation,
-        "invocations": [*previous_history, invocation],
+        "invocations": [*history, invocation],
     }
     _write_json_atomic(timing_path, report)
-    compact = ", ".join(
-        f"{name}=" + (
-            "n/a" if stage_elapsed[name] is None
-            else f"{stage_elapsed[name]:.1f}s")
-        for name in names)
+    compact = ", ".join(f"{label}={elapsed:.1f}s" for label, elapsed in stage_elapsed.items())
     print(
-        f"[timing] {compact}; stage-sum={sum(available_elapsed):.1f}s; "
+        f"[timing] {compact}; stage-sum={report['sum_stage_elapsed_seconds']:.1f}s; "
         f"this invocation={invocation_elapsed:.1f}s",
         flush=True,
     )
     print(f"[timing] report={timing_path}", flush=True)
 
 
-def _skip_or_require_clean(name: str, path: Path, complete: bool,
-                           args: argparse.Namespace, *, resumable=False) -> bool:
-    if complete:
-        if args.resume:
-            print(f"[pipeline] {name}: complete, skipping", flush=True)
-            return True
-        raise FileExistsError(f"{name} output already exists: {path}")
-    if _nonempty(path) and not resumable:
-        raise RuntimeError(
-            f"{name} output is incomplete and will not be overwritten: {path}. "
-            "Inspect it, then use a new output directory or remove only that "
-            "incomplete stage yourself.")
-    return False
-
-
-def _denoise(args: argparse.Namespace, paths: dict[str, Path]) -> None:
-    complete = _denoising_complete(paths["denoising"], args)
-    if _skip_or_require_clean("denoising", paths["denoising"], complete, args):
-        return
-    _run(_denoise_command(args, paths), dry_run=args.dry_run)
-    if not args.dry_run and not _denoising_complete(paths["denoising"], args):
-        raise RuntimeError("denoising returned without complete outputs")
-
-
-def _select(args: argparse.Namespace, paths: dict[str, Path]) -> None:
-    if not args.dry_run and not _denoising_complete(paths["denoising"], args):
-        raise FileNotFoundError("selection requires a completed denoising stage")
-    complete = _selection_complete(paths["selection"], args)
-    if complete and _skip_or_require_clean(
-            "selection", paths["selection"], complete, args):
-        return
-    _require_selection_outputs_absent(paths["selection"])
-    _run(_selection_command(args, paths), dry_run=args.dry_run)
-    if not args.dry_run and not _selection_complete(paths["selection"], args):
-        raise RuntimeError("selection returned without complete outputs")
-
-
-def _prepare(args: argparse.Namespace, paths: dict[str, Path]) -> None:
-    if not args.dry_run:
-        if not _denoising_complete(paths["denoising"], args):
-            raise FileNotFoundError("moment preparation requires denoising outputs")
-        if not _selection_complete(paths["selection"], args):
-            raise FileNotFoundError("moment preparation requires selection outputs")
-    complete = _prepared_complete(paths["prepared"], args)
-    if _skip_or_require_clean("moment preparation", paths["prepared"],
-                              complete, args):
-        return
-    description = (
-        "prepare_moments(denoising={!s}, selection={!s}, output={!s}, "
-        "n_images={}, denoise_res={}, moment_res={}, max_m3_entries={}, "
-        "fb_ell_max={})"
-    ).format(paths["denoising"], paths["selection"] / "selection.npz",
-             paths["prepared"], args.n_select, args.denoise_res,
-             args.moment_res, args.max_m3_entries, args.ell_max)
-    print("[pipeline] " + description, flush=True)
-    if args.dry_run:
-        return
-    from .postprocessing import MomentPreparationConfig, prepare_moments
-
-    prepare_moments(MomentPreparationConfig(
-        denoising_dir=paths["denoising"],
-        selection_file=paths["selection"] / "selection.npz",
-        output_dir=paths["prepared"],
-        expected_dataset=_dataset_label(args), n_images=args.n_select,
-        denoise_res=args.denoise_res, moment_res=args.moment_res,
-        batch_size=args.batch_size, device=args.device,
-        max_m3_entries=args.max_m3_entries, fb_ell_max=args.ell_max,
-        augment_reflections=args.augment_reflections,
-    ))
-    if not _prepared_complete(paths["prepared"], args):
-        raise RuntimeError("moment preparation returned without complete outputs")
-
-
-def _reconstruct(args: argparse.Namespace, paths: dict[str, Path],
-                 order: int) -> None:
-    if not args.dry_run and not _prepared_complete(paths["prepared"], args):
-        raise FileNotFoundError("reconstruction requires prepared moments")
-    output = paths[f"m{order}"]
-    initial_fit = None
-    if order > 1:
-        initial_fit = paths[f"m{order - 1}"]
-        if not args.dry_run and not _fit_complete(initial_fit, args, order - 1):
-            raise FileNotFoundError(
-                f"M{order} requires a completed compatible M{order - 1} "
-                f"reconstruction in {initial_fit}")
-    complete = _fit_complete(output, args, order)
-    if _skip_or_require_clean(
-            f"M{order} reconstruction", output, complete, args,
-            resumable=args.resume):
-        return
-    description = (
-        "reconstruct_single_moment(prepared={!s}, output={!s}, order={}, "
-        "L={}, viewing_degree={}, sphere_request={}, sphere_degree={}, "
-        "n_inplane=1, n_init={}, maxiter={}, initial_fit={!s})"
-    ).format(paths["prepared"], output, order, args.ell_max,
-             args.viewing_degree, args.sphere_nodes, args.sphere_degree,
-             args.n_init, args.maxiter, initial_fit)
-    print("[pipeline] " + description, flush=True)
-    print("[pipeline] shift distribution: "
-          + ("off" if not args.shift_distribution else
-             f"rings every {args.shift_step_px} px up to "
-             f"{'side/8' if args.shift_max_px is None else args.shift_max_px} px (M1, M2, M3)"), flush=True)
-    if args.dry_run:
-        return
-    from .postprocessing import ReconstructionConfig, reconstruct_single_moment
-
-    config = ReconstructionConfig(
-        prepared_dir=paths["prepared"], output_dir=output, order=order,
-        ell_max=args.ell_max, viewing_degree=args.viewing_degree,
-        sphere_nodes=args.sphere_nodes, sphere_degree=args.sphere_degree,
-        n_init=args.n_init, maxiter=args.maxiter, device=args.device,
-        seed=args.seed, resume=args.resume,
-        initial_fit=initial_fit,
-    )
-    shift = _shift_settings(args, paths["prepared"])
-    _check_shift_settings(output.parent, shift)
-    if shift is None:
-        reconstruct_single_moment(config)
-    else:
-        from . import shift_distribution
-        warm = (shift_distribution.read_records(paths[f"m{order - 1}"] / "shift_distribution.json")
-                if order > 1 else None)
-        with shift_distribution.shift_law(shift["step_px"], shift["max_px"], warm=[r["d"] for r in warm or []]) as law:
-            reconstruct_single_moment(config)
-        shift_distribution.write_records(law, output / "shift_distribution.json")
-    if not _fit_complete(output, args, order):
-        raise RuntimeError(f"M{order} reconstruction returned incomplete outputs")
-
-
-def _resolve_particles_argument(parser, args):
-    legacy = vars(args).pop("legacy_star_path", None)
-    if legacy is not None:
-        if args.star_path is not None:
-            parser.error("provide particles either positionally or with --star-path, not both")
-        args.star_path = legacy
-    if args.star_path is None:
-        parser.error("particles STAR file is required")
-
-
-def _add_centering_arguments(parser):
-    parser.add_argument(
-        "--do-global-centering", dest="centering",
-        action=argparse.BooleanOptionalAction, default=True,
-        help=("estimate a shift common to the dataset from the CTF-corrected mean image and "
-              "correct it before denoising, without RELION poses, shifts or reference maps; "
-              "enabled by default. The remaining per-image shifts are not estimated: "
-              "they are modeled by the shift distribution fitted in the M1, M2 and M3 stages"))
-
-
-
 def _pipeline_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="kam pipeline", description=__doc__, allow_abbrev=False,
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("star_path", metavar="particles", nargs="?", type=Path,
+        prog="kam pipeline", allow_abbrev=False, formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        description=("Denoise the particles, select the least crowded ones and reconstruct the map from their M1, M2 and M3 "
+                     "Fourier-Bessel moments. A run writes to <results>/<EMPIAR-number>_<SLURM-job-id>/kam_pipeline (a local "
+                     "identifier outside Slurm); resolved settings go to hyperparameters.json and live progress to run.log."))
+    parser.add_argument("star_path", metavar="particles", type=Path,
                         help="input particles STAR file (including CTF/optics metadata)")
-    parser.add_argument("--star-path", dest="legacy_star_path", type=Path,
-                        help=argparse.SUPPRESS)
     parser.add_argument(
-        "--outdir", "-o", "--results-dir", dest="results_dir", type=Path,
+        "--outdir", dest="results_dir", type=Path,
         help=("parent results directory; writes "
               "<EMPIAR-number>_<SLURM-job-id>/kam_pipeline inside it"))
     parser.add_argument("--dataset-label",
                         help="provenance label only; never changes the algorithm")
-    parser.add_argument("--datadir", "--data-folder", dest="data_folder", type=Path)
-    parser.add_argument("--strip-prefix", "--stack-prefix", dest="stack_prefix")
+    parser.add_argument("--datadir", dest="data_folder", type=Path)
+    parser.add_argument("--strip-prefix", dest="stack_prefix")
     parser.add_argument("--native-pixel-size", type=float)
     parser.add_argument("--n-select", type=int, default=DEFAULT_N_SELECT)
     parser.add_argument("--seed", type=int, default=0)
@@ -1207,9 +667,8 @@ def _pipeline_parser() -> argparse.ArgumentParser:
         "--denoise-res", type=int, default=DEFAULT_DENOISE_RES,
         help="side length used by FastPCA denoising")
     parser.add_argument(
-        "--denoise-max-order", type=int, default=None,
-        help="largest angular order |nu| of the Fourier-Bessel basis in FastPCA/CWF denoising; by default every order the basis supports")
-    _add_centering_arguments(parser)
+        "--denoise-max-order", type=int, default=DEFAULT_DENOISE_MAX_ORDER,
+        help="largest angular order |nu| of the Fourier-Bessel basis in FastPCA/CWF denoising (the 64 px basis supports 88)")
     parser.add_argument(
         "--moment-res", type=int, default=DEFAULT_MOMENT_RES,
         help="side length of images used to form complete moments")
@@ -1221,23 +680,18 @@ def _pipeline_parser() -> argparse.ArgumentParser:
         "--viewing-degree", type=int, choices=(0, 2, 4),
         default=DEFAULT_VIEWING_DEGREE,
         help="degree of the positive spherical-harmonic viewing density")
-    parser.add_argument("--sphere-nodes", type=int,
-                        default=DEFAULT_SPHERE_NODES,
-                        help="requested sphere-rule size; actual size is reported")
     parser.add_argument(
-        "--sphere-degree", default="auto",
-        help=("select the smallest positive-weight quadrature of this degree; "
-              "'auto' (the default) uses 3*vol_degree + viewing_degree, the "
-              "exactness requirement of the M3 model, and 'none' selects by "
-              "--sphere-nodes instead"))
+        "--symmetry", default="C1",
+        help="point group of the molecule (C1, Cn, Dn, T, O or I; axes as in kam.symmetry): the volume coefficients are restricted to it")
     parser.add_argument(
-        "--n-init", type=int, default=DEFAULT_N_INIT,
-        help=("random M2 starts; M2 init_i then warm-starts the paired "
-              "M3 init_i"))
+        "--shift-step-px", type=float, default=DEFAULT_SHIFT_STEP_PX,
+        help=("spacing of the rings of the shift distribution in moment-grid pixels (sub-pixel allowed); the per-image shifts "
+              "are modeled by an isotropic radial distribution on these rings, "
+              "fitted jointly with the volume and the viewing density in each of the M1, M2 and M3 stages (see kam.shift_distribution)"))
     parser.add_argument(
-        "--maxiter", type=int, default=DEFAULT_MAXITER,
-        help="maximum L-BFGS iterations per initialization")
-    _add_shift_arguments(parser)
+        "--shift-max-px", type=float, default=None,
+        help=("largest ring radius in moment-grid pixels (default: a quarter of the radius of the "
+              "downsampled moment images, i.e. side / 8)"))
     parser.add_argument(
         "--device", choices=("cpu", "gpu"), default="gpu",
         help="backend for FastPCA FLE transforms and MoM computation")
@@ -1248,104 +702,30 @@ def _pipeline_parser() -> argparse.ArgumentParser:
     parser.add_argument("--background-radius", type=float, default=0.9)
     parser.add_argument("--flip-sign", action=argparse.BooleanOptionalAction,
                         default=True)
-    neighbor_distance = parser.add_mutually_exclusive_group()
-    neighbor_distance.add_argument(
-        "--neighbor-distance-fraction", type=float,
-        default=DEFAULT_NEIGHBOR_FRACTION,
-        help="minimum pick separation as a fraction of native box side")
-    neighbor_distance.add_argument(
-        "--neighbor-distance-coordinate-pixels", type=float,
-        help=("explicit minimum pick separation in RELION coordinate-column "
-              "units; overrides the fractional default"))
-    parser.add_argument("--max-score-quantile", type=float, default=0.95)
-    parser.add_argument("--n-preview", type=int, default=100)
-    parser.add_argument("--max-m3-entries", type=int,
-                        default=DEFAULT_MAX_M3_ENTRIES)
     parser.add_argument(
-        "--augment-reflections", action=argparse.BooleanOptionalAction,
-        default=False,
-        help=("average every image with its mirror when forming moments "
-              "(implemented exactly as the real part of the FB moments); "
-              "the fit then compares real parts on both sides, equivalent "
-              "to an antipodally symmetric viewing density"))
+        "--neighbor-distance-fraction", type=float, default=DEFAULT_NEIGHBOR_FRACTION,
+        help="minimum pick separation as a fraction of the box (field of view) of the particle images")
+    parser.add_argument("--n-preview", type=int, default=100)
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction,
                         default=True)
     parser.add_argument("--dry-run", action="store_true")
     return parser
 
 
-def _resolve_sphere_degree(parser, args):
-    """Resolve --sphere-degree: 'auto' matches the M3 exactness requirement."""
-    requested = args.sphere_degree
-    if requested is None or str(requested).lower() in ("none", "off"):
-        args.sphere_degree = None
-        return
-    if str(requested).lower() == "auto":
-        args.sphere_degree = 3 * args.ell_max + args.viewing_degree
-        return
-    try:
-        args.sphere_degree = int(requested)
-    except ValueError:
-        parser.error("--sphere-degree must be an integer, 'auto', or 'none'")
-
-
-def _validate_args(parser: argparse.ArgumentParser,
-                   args: argparse.Namespace) -> None:
-    _resolve_particles_argument(parser, args)
-    _resolve_sphere_degree(parser, args)
-    if args.star_path is None or args.results_dir is None:
-        parser.error("particles and --outdir are required")
-    try:
-        _dataset_number(args)
-    except ValueError as error:
-        parser.error(str(error))
-    if args.n_select < 1:
-        parser.error("n-select must be positive")
-    if args.denoise_max_order is not None and args.denoise_max_order < 1:
-        parser.error("denoise-max-order must be positive")
-    if args.n_preview < 1 or args.batch_size < 1 or args.workers < 1:
-        parser.error("preview, batch, and worker counts must be positive")
-    if (args.denoise_res < 4 or args.denoise_res % 2
-            or args.moment_res < 4 or args.moment_res % 2
-            or args.moment_res > args.denoise_res):
-        parser.error(
-            "denoise-res and moment-res must be even and >=4, with moment-res "
-            "not exceeding denoise-res")
-    if (args.ell_max < 0 or args.sphere_nodes < 1
-            or args.n_init < 1 or args.maxiter < 1
-            or args.max_m3_entries < 1):
-        parser.error("model, quadrature, initialization, and iteration counts are invalid")
-    if (not 0 < args.background_radius < math.sqrt(2)
-            or args.ctf_mean_defocus_bin < 0
-            or args.neighbor_distance_fraction <= 0
-            or (args.neighbor_distance_coordinate_pixels is not None
-                and args.neighbor_distance_coordinate_pixels <= 0)
-            or not 0 < args.max_score_quantile <= 1):
-        parser.error("continuous hyperparameters are outside their valid ranges")
-    if args.native_pixel_size is not None and args.native_pixel_size <= 0:
-        parser.error("native pixel size must be positive")
-    from .moments import FBMomentBasis
-    try:
-        args.expected_m3_entries = FBMomentBasis(
-            args.moment_res, args.ell_max).m3_size
-    except ValueError as error:
-        parser.error(str(error))
-    if args.expected_m3_entries > args.max_m3_entries:
-        parser.error(
-            f"side-{args.moment_res} Fourier-Bessel M3 has "
-            f"{args.expected_m3_entries:,} entries, exceeding "
-            f"--max-m3-entries={args.max_m3_entries:,}")
-    if not args.dry_run:
-        if not args.star_path.expanduser().is_file():
-            parser.error(f"STAR file does not exist: {args.star_path}")
-        if args.data_folder is not None and not args.data_folder.expanduser().is_dir():
-            parser.error(f"data folder does not exist: {args.data_folder}")
+def _write_selected_star(star_path: Path, rows, output: Path) -> None:
+    """Write a STAR holding only ``rows`` of the particle loop (the last loop in the file)."""
+    lines = Path(star_path).read_text().split("\n")
+    start = max(i for i, line in enumerate(lines) if line.startswith("loop_")) + 1
+    while start < len(lines) and lines[start].startswith("_rln"):
+        start += 1
+    body = [line for line in lines[start:] if line.strip()]
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text("\n".join(lines[:start] + [body[k] for k in rows]) + "\n")
 
 
 def pipeline_main(argv=None) -> None:
     parser = _pipeline_parser()
     args = parser.parse_args(argv)
-    _validate_args(parser, args)
     paths = _paths(args)
     invocation_started_utc = datetime.now(timezone.utc).isoformat()
     invocation_started = time.monotonic()
@@ -1360,16 +740,12 @@ def pipeline_main(argv=None) -> None:
               flush=True)
         print(f"[pipeline] run_root={paths['run_root']}", flush=True)
         print(f"[pipeline] output={paths['root']} resume={args.resume}", flush=True)
-        print(
-            f"[pipeline] centering={args.centering} "
-            f"method={CENTERING_METHOD if args.centering else 'none'}; "
-            "RELION origins/poses and reference maps are not used for centering",
-            flush=True)
         try:
             _ensure_manifest(args, paths)
             parameters = _hyperparameters(args, paths)
-            parameters["started_utc"] = invocation_started_utc
-            _write_json_atomic(paths["hyperparameters"], parameters)
+            if not paths["hyperparameters"].exists():
+                _write_json_exclusive(
+                    paths["hyperparameters"], {**parameters, "started_utc": invocation_started_utc})
             print(f"[pipeline] hyperparameters={paths['hyperparameters']}", flush=True)
             print(json.dumps(parameters["arguments"], indent=2), flush=True)
             _execute_pipeline(args, paths, invocation_started_utc, invocation_started)
@@ -1385,20 +761,21 @@ def pipeline_main(argv=None) -> None:
 
 
 def _execute_pipeline(args, paths, invocation_started_utc, invocation_started):
+    stages = _stages(args, paths)
     statuses = {}
     observed = {}
 
-    def run_stage(name, function) -> None:
+    def run_stage(label, function) -> None:
         stage_started_utc = datetime.now(timezone.utc).isoformat()
         stage_started = time.monotonic()
-        print(f"[{stage_started_utc}] STEP {len(statuses) + 1}/5 START {name}",
+        print(f"[{stage_started_utc}] STEP {len(statuses) + 1}/{len(stages)} START {label}",
               flush=True)
         stop_heartbeat = threading.Event()
 
         def heartbeat():
             while not stop_heartbeat.wait(PIPELINE_HEARTBEAT_SECONDS):
                 print(f"[{datetime.now(timezone.utc).isoformat()}] "
-                      f"{name} RUNNING elapsed={time.monotonic() - stage_started:.1f}s",
+                      f"{label} RUNNING elapsed={time.monotonic() - stage_started:.1f}s",
                       flush=True)
 
         monitor = None
@@ -1406,34 +783,11 @@ def _execute_pipeline(args, paths, invocation_started_utc, invocation_started):
             monitor = threading.Thread(target=heartbeat, daemon=True)
             monitor.start()
         try:
-            already_complete = (
-                False if args.dry_run else _stage_complete(name, paths, args))
-            had_partial_output = (
-                False if args.dry_run
-                else (any((paths["selection"] / item).exists()
-                          for item in SELECTION_OUTPUT_NAMES)
-                      if name == "select"
-                      else _nonempty(_stage_report_path(paths, name).parent)))
-            function()
-            stage_elapsed = time.monotonic() - stage_started
-            observed[name] = float(stage_elapsed)
-            if args.dry_run:
-                statuses[name] = "dry_run"
-            else:
-                stage_finished_utc = datetime.now(timezone.utc).isoformat()
-                if already_complete:
-                    statuses[name] = "skipped_completed"
-                else:
-                    statuses[name] = (
-                        "resumed_and_completed" if had_partial_output
-                        else "completed_this_invocation")
-                    _annotate_new_stage_timing(
-                        _stage_report_path(paths, name), stage_elapsed,
-                        stage_started_utc, stage_finished_utc)
-                if not _stage_complete(name, paths, args):
-                    raise RuntimeError(f"{name} lacks complete outputs after its stage")
+            status = function()
+            observed[label] = float(time.monotonic() - stage_started)
+            statuses[label] = "dry_run" if args.dry_run else status
         except BaseException:
-            print(f"[{datetime.now(timezone.utc).isoformat()}] STEP FAILED {name} "
+            print(f"[{datetime.now(timezone.utc).isoformat()}] STEP FAILED {label} "
                   f"elapsed={time.monotonic() - stage_started:.1f}s",
                   file=sys.stderr, flush=True)
             raise
@@ -1441,63 +795,54 @@ def _execute_pipeline(args, paths, invocation_started_utc, invocation_started):
             stop_heartbeat.set()
             if monitor is not None:
                 monitor.join()
-        print(f"[{datetime.now(timezone.utc).isoformat()}] STEP END {name} "
-              f"status={statuses[name]} elapsed={observed[name]:.1f}s", flush=True)
+        print(f"[{datetime.now(timezone.utc).isoformat()}] STEP END {label} "
+              f"status={statuses[label]} elapsed={observed[label]:.1f}s", flush=True)
 
-    run_stage("denoise", lambda: _denoise(args, paths))
-    run_stage("select", lambda: _select(args, paths))
-    run_stage("prepare", lambda: _prepare(args, paths))
-    run_stage("m1", lambda: _reconstruct(args, paths, 1))
-    run_stage("m2", lambda: _reconstruct(args, paths, 2))
-    run_stage("m3", lambda: _reconstruct(args, paths, 3))
+    for label, _, function in stages:
+        run_stage(label, function)
     if not args.dry_run:
         invocation_finished_utc = datetime.now(timezone.utc).isoformat()
         _write_timing_report(
-            args, paths, statuses, observed,
+            args, paths, stages, statuses, observed,
             invocation_started_utc, invocation_finished_utc,
             time.monotonic() - invocation_started)
         _write_json_atomic(paths["root"] / "pipeline_report.json", {
             "complete": True,
             "dataset": _dataset_label(args),
             "initializer": str(paths["m3"] / "recon.mrc"),
-            "reconstructions": {
-                "M2": str(paths["m2"] / "recon.mrc"),
-                "M3": str(paths["m3"] / "recon.mrc"),
-            },
+            "reconstructions": {f"M{order}": str(paths[f"m{order}"] / "recon.mrc") for order in (1, 2, 3)},
             "diagnostics": {
-                **({"centering_before_after": str(paths["centering"] / "before_after.pdf")}
-                   if args.centering else {}),
                 "denoising_preview": str(paths["denoising"] / "denoising_preview.pdf"),
                 "selection_diagnostic": str(paths["selection"] / "selection_diagnostic.pdf"),
                 "selection_scores": str(paths["selection"] / "selection_scores.pdf"),
+                "selection_selected_sample": str(
+                    paths["selection"] / "selection_selected_sample.pdf"),
+                "redenoising_preview": str(paths["redenoised"] / "denoising_preview.pdf"),
             },
             "timing_report": str(paths["timing_report"]),
             "hyperparameters": str(paths["hyperparameters"]),
             "log": str(paths["log"]),
         })
-    print(f"[pipeline] finished M2 then M3; output={paths['root']}",
+    print(f"[pipeline] finished M1, M2 and M3; output={paths['root']}",
           flush=True)
 
 
-
 # ===========================================================================
-# FastPCA denoising subcommand (was denoise_cli.py)
+# FastPCA denoising subcommand
 # ===========================================================================
 
 def _denoise_parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset-label", required=True)
-    parser.add_argument("star_path", metavar="particles", nargs="?", type=Path,
+    parser.add_argument("star_path", metavar="particles", type=Path,
                         help="input particles STAR file")
-    parser.add_argument("--star-path", dest="legacy_star_path", type=Path,
-                        help=argparse.SUPPRESS)
     parser.add_argument(
-        "--datadir", "--data-folder", dest="data_folder",
+        "--datadir", dest="data_folder",
         type=Path,
         help="Root for relative stack paths; default is the STAR directory",
     )
     parser.add_argument(
-        "--strip-prefix", "--stack-prefix", dest="stack_prefix",
+        "--strip-prefix", dest="stack_prefix",
         help="Optional leading relative directory to strip from STAR stack paths",
     )
     parser.add_argument(
@@ -1507,8 +852,6 @@ def _denoise_parse_args(argv=None):
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--denoise-res", type=int, default=64)
-    _add_centering_arguments(parser)
-    parser.add_argument("--centering-output-dir", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument(
         "--device", choices=("cpu", "gpu"), default="gpu",
@@ -1520,13 +863,13 @@ def _denoise_parse_args(argv=None):
         default=int(os.environ.get("SLURM_CPUS_PER_TASK", "1")),
         help="Parallel native-image readers per bounded loading batch",
     )
-    parser.add_argument("--outdir", "-o", "--output-dir", dest="output_dir",
+    parser.add_argument("--outdir", dest="output_dir",
                         type=Path, required=True)
     parser.add_argument("--background-radius", type=float, default=0.9)
     parser.add_argument("--eps", type=float, default=1e-3)
     parser.add_argument(
-        "--denoise-max-order", type=int, default=None,
-        help="largest angular order |nu| of the Fourier-Bessel basis in FastPCA/CWF denoising; by default every order the basis supports")
+        "--denoise-max-order", type=int, default=DEFAULT_DENOISE_MAX_ORDER,
+        help="largest angular order |nu| of the Fourier-Bessel basis in FastPCA/CWF denoising (the 64 px basis supports 88)")
     parser.add_argument(
         "--ctf-mean-defocus-bin",
         type=float,
@@ -1542,31 +885,6 @@ def _denoise_parse_args(argv=None):
     )
     args = parser.parse_args(argv)
     args.n_images = 0
-    _resolve_particles_argument(parser, args)
-    try:
-        FastCWFDenoiseConfig(
-            dataset_label=args.dataset_label,
-            star_path=args.star_path,
-            data_folder=args.data_folder,
-            stack_prefix=args.stack_prefix,
-            native_pixel_size=args.native_pixel_size,
-            n_images=args.n_images,
-            seed=args.seed,
-            denoise_res=args.denoise_res,
-            batch_size=args.batch_size,
-            workers=args.workers,
-            device=args.device,
-            output_dir=args.output_dir,
-            background_radius=args.background_radius,
-            eps=args.eps,
-            denoise_max_order=args.denoise_max_order,
-            ctf_mean_defocus_bin=args.ctf_mean_defocus_bin,
-            flip_sign=args.flip_sign,
-            centering=args.centering,
-            centering_output_dir=args.centering_output_dir,
-        )
-    except (TypeError, ValueError) as error:
-        parser.error(str(error))
     return args
 
 
@@ -1591,25 +909,17 @@ def denoise_main(argv=None):
             denoise_max_order=args.denoise_max_order,
             ctf_mean_defocus_bin=args.ctf_mean_defocus_bin,
             flip_sign=args.flip_sign,
-            centering=args.centering,
-            centering_output_dir=args.centering_output_dir,
-            driver_path=Path(__file__),
         )
     )
 
 
-
 # ===========================================================================
-# Low-crowding selection subcommand (was selection_cli.py)
+# Low-crowding selection subcommand
 # ===========================================================================
 
 def scalar(manifest, name):
     """Read one scalar from an NPZ manifest."""
-    if name not in manifest:
-        raise ValueError(f"denoising manifest is missing {name!r}")
     value = np.asarray(manifest[name])
-    if value.size != 1:
-        raise ValueError(f"manifest field {name!r} must be scalar")
     return value.reshape(()).item()
 
 
@@ -1624,21 +934,6 @@ def optional_text(manifest, name):
     return None if text.lower() in {"", "none", "null"} else text
 
 
-def sha256_file(path):
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-
-def git_commit(path):
-    result = subprocess.run(
-        ["git", "-C", str(path), "rev-parse", "HEAD"],
-        capture_output=True, text=True, check=False)
-    return result.stdout.strip() if result.returncode == 0 else None
-
-
 def resolve_manifest_path(text, base):
     path = Path(text).expanduser()
     if not path.is_absolute():
@@ -1646,34 +941,12 @@ def resolve_manifest_path(text, base):
     return path.resolve(strict=True)
 
 
-def viewing_tv(particles, source_rows, selected_mask):
-    """Compute an optional post-hoc viewing diagnostic."""
-    required = ("_rlnAngleRot", "_rlnAngleTilt")
-    if any(name not in particles.metadata for name in required):
-        return None
-    rot = np.mod(particles.column("_rlnAngleRot")[source_rows], 360.0)
-    tilt = np.deg2rad(particles.column("_rlnAngleTilt")[source_rows])
-    azimuth_bin = np.minimum((rot / 30.0).astype(int), 11)
-    polar_bin = np.minimum(((np.cos(tilt) + 1.0) * 3.0).astype(int), 5)
-    bins = polar_bin * 12 + azimuth_bin
-    full = np.bincount(bins, minlength=72).astype(float)
-    selected = np.bincount(bins[selected_mask], minlength=72).astype(float)
-    full /= full.sum()
-    selected /= selected.sum()
-    return float(0.5 * np.sum(np.abs(selected - full)))
-
-
 def save_selection_diagnostic(images, selected, path, scores=None):
     """Save a random audit montage with a check or cross beside each image."""
     images = np.asarray(images)
     selected = np.asarray(selected, dtype=bool)
-    if (images.ndim != 3 or images.shape[1] != images.shape[2]
-            or selected.shape != (len(images),) or len(images) < 1):
-        raise ValueError("diagnostic images and selection labels are incompatible")
     if scores is not None:
         scores = np.asarray(scores, dtype=float)
-        if scores.shape != (len(images),) or not np.all(np.isfinite(scores)):
-            raise ValueError("diagnostic scores must be finite, one per image")
 
     columns = int(np.ceil(np.sqrt(len(images))))
     rows = int(np.ceil(len(images) / columns))
@@ -1726,6 +999,7 @@ def save_selection_diagnostic(images, selected, path, scores=None):
 SELECTION_OUTPUT_NAMES = (
     "selection.npz", "selection_report.json", "selected_particles.tsv",
     "selection_diagnostic.pdf", "selection_scores.pdf",
+    "selection_selected_sample.pdf",
 )
 
 
@@ -1738,13 +1012,31 @@ def _require_selection_outputs_absent(output: Path) -> None:
             f"selection output already exists in {output}: {', '.join(existing)}")
 
 
+def save_selected_sample(images, scores, path, columns=20):
+    """Save a montage of selected particles with the crowding score in the corner."""
+    images = np.asarray(images)
+    rows = int(np.ceil(len(images) / columns))
+    figure, axes = plt.subplots(
+        rows, columns, figsize=(1.5 * columns, 1.5 * rows + 0.4), squeeze=False)
+    for axis in axes.ravel():
+        axis.set_axis_off()
+    for axis, image, score in zip(axes.ravel(), images, scores):
+        show_particle_image(axis, image)
+        axis.text(0.03, 0.03, f"{score:.2f}", transform=axis.transAxes,
+                  fontsize=6, color="white",
+                  bbox={"facecolor": "black", "alpha": 0.6,
+                        "edgecolor": "none", "pad": 1})
+    figure.suptitle(f"{len(images)} random selected particles "
+                    "(corner: crowding score)", y=0.998)
+    figure.subplots_adjust(0.003, 0.003, 0.997, 0.97, 0.03, 0.03)
+    figure.savefig(path.with_suffix(".pdf"), dpi=100)
+    plt.close(figure)
+
+
 def save_selection_scores(scores, selected, score_ceiling, path):
     """Compare selected and rejected image scores using the same histogram bins."""
     scores = np.asarray(scores, dtype=float)
     selected = np.asarray(selected, dtype=bool)
-    if (scores.ndim != 1 or selected.shape != scores.shape
-            or not scores.size or not np.all(np.isfinite(scores))):
-        raise ValueError("selection scores must be finite and match the selection")
     edges = np.histogram_bin_edges(scores, bins=60)
     figure, axis = plt.subplots(figsize=(6.0, 4.0))
     axis.hist([scores[selected], scores[~selected]], bins=edges, stacked=True,
@@ -1759,66 +1051,11 @@ def save_selection_scores(scores, selected, score_ceiling, path):
     plt.close(figure)
 
 
-def validate_manifest(manifest, manifest_path):
-    required_arrays = ("source_rows", "image_names", "contrast_est")
-    missing = [name for name in required_arrays if name not in manifest]
-    if missing:
-        raise ValueError(f"denoising manifest is missing fields: {missing}")
-    expected_flags = {
-        "ctf_corrected": True,
-        "noise_denoised": True,
-        "background_mean_removed": True,
-        "contrast_removed": False,
-        "whitened_output": False,
-        "reference_used": False,
-        "relion_poses_used": False,
-    }
-    for name, expected in expected_flags.items():
-        actual = scalar(manifest, name)
-        if bool(actual) != expected:
-            raise ValueError(
-                f"denoising manifest requires {name}={expected}, got {actual!r}")
-
-    count = int(scalar(manifest, "n_images"))
-    native_res = int(scalar(manifest, "native_res"))
-    denoise_res = int(scalar(manifest, "denoise_res"))
-    vox_native = float(scalar(manifest, "vox_native"))
-    if count < 1 or native_res < 1 or not 1 <= denoise_res <= native_res:
-        raise ValueError("manifest contains invalid image dimensions or count")
-    if not np.isfinite(vox_native) or vox_native <= 0:
-        raise ValueError("manifest native pixel size must be finite and positive")
-
-    source_rows = np.asarray(manifest["source_rows"], dtype=np.int64)
-    image_names = np.asarray(manifest["image_names"], dtype=str)
-    contrast = np.asarray(manifest["contrast_est"], dtype=np.float64)
-    if source_rows.shape != (count,) or np.any(source_rows < 0):
-        raise ValueError("manifest source_rows are invalid")
-    if len(np.unique(source_rows)) != count:
-        raise ValueError("manifest source_rows must be unique")
-    if image_names.shape != (count,):
-        raise ValueError("manifest image_names are invalid")
-    if contrast.shape != (count,) or not np.all(np.isfinite(contrast)):
-        raise ValueError("manifest contrast estimates are invalid")
-
-    declared_stack = optional_text(manifest, "denoised_stack")
-    fallback = manifest_path.parent / "denoised_images.mrcs"
-    stack_path = (resolve_manifest_path(declared_stack, manifest_path.parent)
-                  if declared_stack is not None else fallback.resolve(strict=True))
-    stat = stack_path.stat()
-    if "stack_size" in manifest and stat.st_size != int(scalar(manifest, "stack_size")):
-        raise ValueError("denoised stack size differs from its manifest")
-    if ("stack_mtime_ns" in manifest
-            and stat.st_mtime_ns != int(scalar(manifest, "stack_mtime_ns"))):
-        raise ValueError("denoised stack modification time differs from its manifest")
-    with mrcfile.mmap(stack_path, mode="r", permissive=False) as stack:
-        if stack.data.shape != (count, denoise_res, denoise_res):
-            raise ValueError(
-                f"stack shape {stack.data.shape} differs from the manifest")
-        denoise_pixel = vox_native * native_res / denoise_res
-        header_pixel = float(stack.voxel_size.x)
-        if not np.isclose(header_pixel, denoise_pixel, rtol=1e-5, atol=1e-5):
-            raise ValueError("denoised stack pixel size differs from the manifest")
-    return stack_path, count, native_res, denoise_res, vox_native
+def manifest_geometry(manifest, manifest_path):
+    """The denoised stack of a denoising manifest with its image count, native and denoised side and native pixel size."""
+    stack_path = resolve_manifest_path(str(scalar(manifest, "denoised_stack")), manifest_path.parent)
+    return (stack_path, int(scalar(manifest, "n_images")), int(scalar(manifest, "native_res")),
+            int(scalar(manifest, "denoise_res")), float(scalar(manifest, "vox_native")))
 
 
 def _selection_parser():
@@ -1827,19 +1064,14 @@ def _selection_parser():
     parser.add_argument("--n-select", type=int, default=10_000)
     parser.add_argument("--n-preview", type=int, default=100)
     parser.add_argument("--seed", type=int, default=0)
-    distance = parser.add_mutually_exclusive_group()
-    distance.add_argument(
-        "--neighbor-distance-fraction", type=float,
-        default=DEFAULT_NEIGHBOR_FRACTION,
-        help="minimum pick separation as a fraction of the native box side")
-    distance.add_argument(
-        "--neighbor-distance-coordinate-pixels",
-        "--neighbor-distance-native-pixels",
-        dest="neighbor_distance_coordinate_pixels", type=float,
-        help=("explicit minimum pick separation in the units of the RELION "
-              "coordinate columns, overriding the fractional default"))
+    parser.add_argument(
+        "--neighbor-distance-fraction", type=float, default=DEFAULT_NEIGHBOR_FRACTION,
+        help="minimum pick separation as a fraction of the box (field of view) of the particle images")
     parser.add_argument("--contrast-bins", type=int, default=4)
     parser.add_argument("--max-score-quantile", type=float, default=0.95)
+    parser.add_argument("--auto-score-quantile", action=argparse.BooleanOptionalAction, default=True,
+                        help="use the tightest ceiling leaving --n-select candidates (the default); "
+                             "--no-auto-score-quantile uses --max-score-quantile instead")
     parser.add_argument("--smooth-sigma", type=float, default=1.1)
     parser.add_argument("--inner-radius", type=float, default=0.50)
     parser.add_argument("--outer-radius-min", type=float, default=0.62)
@@ -1847,7 +1079,7 @@ def _selection_parser():
     parser.add_argument("--inner-top-fraction", type=float, default=0.20)
     parser.add_argument("--outer-top-fraction", type=float, default=0.10)
     parser.add_argument("--batch-size", type=int, default=256)
-    parser.add_argument("--outdir", "-o", "--output-dir", dest="output_dir",
+    parser.add_argument("--outdir", dest="output_dir",
                         type=Path, required=True)
     return parser
 
@@ -1856,22 +1088,6 @@ def select_main(argv=None):
     started = time.monotonic()
     parser = _selection_parser()
     args = parser.parse_args(argv)
-    if args.n_select < 1 or args.n_preview < 1:
-        parser.error("selection and preview counts must be positive")
-    if args.batch_size < 1:
-        parser.error("--batch-size must be positive")
-    if not (0 < args.inner_radius < args.outer_radius_min
-            < args.outer_radius_max <= 1):
-        parser.error("radial masks must be ordered inside the unit disk")
-    if (args.neighbor_distance_fraction <= 0 or args.contrast_bins < 1
-            or not 0 < args.max_score_quantile <= 1):
-        parser.error("neighbor fraction and contrast-bin count must be positive")
-    if (args.neighbor_distance_coordinate_pixels is not None
-            and args.neighbor_distance_coordinate_pixels <= 0):
-        parser.error("explicit neighbor distance must be positive")
-    if not (0 < args.inner_top_fraction <= 1
-            and 0 < args.outer_top_fraction <= 1):
-        parser.error("top fractions must lie in (0,1]")
 
     output = args.output_dir.resolve()
     denoising = args.denoising_dir.resolve(strict=True)
@@ -1883,21 +1099,11 @@ def select_main(argv=None):
     manifest_path = (denoising / "manifest.npz").resolve(strict=True)
     with np.load(manifest_path, allow_pickle=False) as saved:
         manifest = {name: saved[name] for name in saved.files}
-    stack_path, count, native_res, side, vox_native = validate_manifest(
-        manifest, manifest_path)
-    if args.n_select > count:
-        parser.error("--n-select exceeds the stack size")
-    if args.n_preview > count:
-        parser.error("--n-preview exceeds the stack size")
-    neighbor_distance = (
-        args.neighbor_distance_coordinate_pixels
-        if args.neighbor_distance_coordinate_pixels is not None
-        else args.neighbor_distance_fraction * native_res)
-    input_validation_done = time.monotonic()
+    stack_path, count, native_res, side, vox_native = manifest_geometry(manifest, manifest_path)
+    input_loading_done = time.monotonic()
 
     source_rows = np.asarray(manifest["source_rows"], dtype=np.int64)
     image_names = np.asarray(manifest["image_names"], dtype=str)
-    from .preprocessing import RelionParticles
 
     star_path = resolve_manifest_path(
         str(scalar(manifest, "star_path")), manifest_path.parent)
@@ -1908,17 +1114,12 @@ def select_main(argv=None):
     particles = RelionParticles(
         star_path, data_folder=data_folder, stack_prefix=stack_prefix,
         pixel_size=vox_native)
-    if np.any(source_rows >= particles.n):
-        raise ValueError("manifest source_rows contains an out-of-range STAR row")
-    np.testing.assert_array_equal(particles.image_names[source_rows], image_names)
-    required = ("_rlnMicrographName", "_rlnCoordinateX", "_rlnCoordinateY")
-    missing = [name for name in required if name not in particles.metadata]
-    if missing:
-        raise ValueError(
-            "low-crowding selection requires micrograph pick metadata: "
-            + ", ".join(missing))
     micrograph_names = np.asarray(
         particles.metadata["_rlnMicrographName"], dtype=str)
+    # The pick coordinates are in micrograph pixels: their size is the optics column _rlnMicrographPixelSize (written for
+    # Fourier-cropped particle stacks), otherwise the particle pixel size. The threshold is the fraction of the field of view.
+    coordinate_pixel = float(particles.column("_rlnMicrographPixelSize", vox_native)[0])
+    neighbor_distance = args.neighbor_distance_fraction * native_res * vox_native / coordinate_pixel
     all_neighbor_distances = nearest_particle_distances(
         micrograph_names, particles.column("_rlnCoordinateX"),
         particles.column("_rlnCoordinateY"))
@@ -1932,6 +1133,7 @@ def select_main(argv=None):
             minimum_neighbor_distance=neighbor_distance,
             contrast_bins=args.contrast_bins,
             max_score_quantile=args.max_score_quantile,
+            auto_score_ceiling=args.auto_score_quantile,
             smooth_sigma=args.smooth_sigma,
             inner_radius=args.inner_radius,
             outer_radius_min=args.outer_radius_min,
@@ -1974,6 +1176,14 @@ def select_main(argv=None):
         output / "selection_diagnostic", scores=scores[diagnostic_positions])
     save_selection_scores(
         scores, selected_mask, score_ceiling, output / "selection_scores")
+    sample_positions = np.sort(np.random.default_rng(
+        np.random.SeedSequence([args.seed, 0x53414D])).choice(
+            selected_positions, min(200, len(selected_positions)), replace=False))
+    with mrcfile.mmap(stack_path, mode="r", permissive=False) as stack:
+        sample_images = np.array(
+            stack.data[sample_positions], dtype=np.float32, copy=True)
+    save_selected_sample(
+        sample_images, scores[sample_positions], output / "selection_selected_sample")
     diagnostic_pdf = output / "selection_diagnostic.pdf"
 
     dataset = optional_text(manifest, "dataset")
@@ -2007,7 +1217,8 @@ def select_main(argv=None):
         input_stack=str(stack_path),
         native_res=native_res,
         native_pixel_size_angstrom=vox_native,
-        minimum_neighbor_distance_fraction=neighbor_distance / native_res,
+        minimum_neighbor_distance_fraction=args.neighbor_distance_fraction,
+        coordinate_pixel_size_angstrom=coordinate_pixel,
         minimum_neighbor_distance_coordinate_pixels=neighbor_distance,
     )
     with (output / "selected_particles.tsv").open("w") as stream:
@@ -2020,12 +1231,11 @@ def select_main(argv=None):
                 f"{scores[position]:.9g}\t{neighbor_distances[position]:.9g}\n")
 
     selection_path = output / "selection.npz"
-    posthoc_viewing_tv = viewing_tv(particles, source_rows, selected_mask)
     before_report_write = time.monotonic()
     timings = {
-        "input_and_manifest_validation": input_validation_done - started,
+        "input_and_manifest_loading": input_loading_done - started,
         "metadata_and_neighbor_setup": (
-            metadata_setup_done - input_validation_done),
+            metadata_setup_done - input_loading_done),
         "scoring_and_selection": selection_done - metadata_setup_done,
         "diagnostic_and_output_writing": before_report_write - selection_done,
     }
@@ -2040,26 +1250,20 @@ def select_main(argv=None):
         "source_data_folder": None if data_folder is None else str(data_folder),
         "source_stack_prefix": stack_prefix,
         "n_input": count,
-        "n_selected": args.n_select,
-        "selected_fraction": args.n_select / count,
+        "n_requested": args.n_select,
+        "n_selected": int(len(selection.selected_positions)),
+        "selected_fraction": len(selection.selected_positions) / count,
         "native_box_pixels": native_res,
         "native_pixel_size_angstrom": vox_native,
         "native_box_size_angstrom": native_res * vox_native,
-        "selection_rule": (
-            "nearest picked neighbor at least the configured distance; capped "
-            "proportional micrograph-by-contrast-bin quotas; lowest image "
-            "crowding score within each stratum"),
-        "score_definition": (
-            "top-RMS positive smoothed signal in the outer annulus divided "
-            "by top-RMS positive smoothed signal in the central disk"),
         "smooth_sigma_pixels_at_denoise_resolution": args.smooth_sigma,
-        "minimum_neighbor_distance_fraction_of_native_box": (
-            neighbor_distance / native_res),
+        "minimum_neighbor_distance_fraction_of_native_box": args.neighbor_distance_fraction,
+        "coordinate_pixel_size_angstrom": coordinate_pixel,
         "minimum_neighbor_distance_coordinate_pixels": neighbor_distance,
-        "coordinate_units": (
-            "numeric units stored in RELION _rlnCoordinateX/_rlnCoordinateY; "
-            "no Angstrom conversion is assumed"),
-        "maximum_crowding_score_quantile": args.max_score_quantile,
+        "score_quantile_mode": "auto" if args.auto_score_quantile else "fixed",
+        "maximum_crowding_score_quantile": (
+            float(np.mean(scores <= score_ceiling)) if args.auto_score_quantile
+            else args.max_score_quantile),
         "maximum_crowding_score": score_ceiling,
         "n_passing_geometry_and_score_gates": int(geometry_pass.sum()),
         "n_micrographs": int(len(np.unique(micrograph_ids))),
@@ -2080,29 +1284,19 @@ def select_main(argv=None):
         "preview_seed": args.seed,
         "n_preview": args.n_preview,
         "selection_diagnostic": {
-            "sampling": "uniform_without_replacement_from_all_denoised_images",
             "seed_sequence": [args.seed, 0x53454C],
             "n_images": int(len(diagnostic_positions)),
             "n_selected": int(np.sum(diagnostic_selected)),
             "n_not_selected": int(np.sum(~diagnostic_selected)),
             "pdf": str(diagnostic_pdf),
             "pdf_sha256": sha256_file(diagnostic_pdf),
-            "annotation": "crowding score; green check selected, red cross not selected",
         },
         "score_plot": {
             "pdf": str(output / "selection_scores.pdf"),
         },
-        "uses_reference_map": False,
-        "uses_relion_poses_for_selection": False,
-        "posthoc_relion_viewing_tv_6x12": posthoc_viewing_tv,
-        "uses_reconstruction": False,
         "elapsed_seconds": before_report_write - started,
         "timings_seconds": timings,
         "provenance": {
-            "selector": str(Path(__file__).resolve()),
-            "selector_sha256": sha256_file(Path(__file__).resolve()),
-            "selection_module": str(PARTICLE_SELECTION_SOURCE.resolve()),
-            "selection_module_sha256": sha256_file(PARTICLE_SELECTION_SOURCE),
             "kam_cryoem_commit": git_commit(ROOT),
             "python": sys.version,
             "numpy": np.__version__,
@@ -2116,14 +1310,10 @@ def select_main(argv=None):
     timings["diagnostic_and_output_writing"] = (
         report_checkpoint - selection_done)
     report["elapsed_seconds"] = report_checkpoint - started
-    timing_values = [report["elapsed_seconds"], *timings.values()]
-    if (not np.all(np.isfinite(timing_values))
-            or any(value < 0.0 for value in timing_values)):
-        raise RuntimeError("selection timing measurements are not finite")
     report_path.write_text(json.dumps(report, indent=2) + "\n")
     print(
         "Selection timing: "
-        f"input={timings['input_and_manifest_validation']:.1f}s, "
+        f"input={timings['input_and_manifest_loading']:.1f}s, "
         f"metadata={timings['metadata_and_neighbor_setup']:.1f}s, "
         f"scoring={timings['scoring_and_selection']:.1f}s, "
         f"outputs={timings['diagnostic_and_output_writing']:.1f}s, "
@@ -2132,71 +1322,9 @@ def select_main(argv=None):
     print(json.dumps(report, indent=2), flush=True)
 
 
-
 # ===========================================================================
 # Standalone map alignment and FSC
 # ===========================================================================
-
-def _align_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description=("Align an existing reconstruction to an external "
-                     "reference and compute its FSC. A coarse reconstruction "
-                     "is Fourier-upsampled at fixed physical field of view to "
-                     "the unchanged native reference grid."),
-        allow_abbrev=False,
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    parser.add_argument("--map", dest="map_path", type=Path, required=True)
-    parser.add_argument("--reference-map", type=Path, required=True)
-    parser.add_argument(
-        "--outdir", "-o", "--output-dir", dest="output_dir", type=Path,
-        required=True)
-    parser.add_argument(
-        "--voxel-size", "--pixel-size", dest="pixel_size", type=float,
-        help="reconstruction voxel size in Angstrom; defaults to its MRC header",
-    )
-    parser.add_argument(
-        "--reference-voxel-size", "--reference-pixel-size",
-        dest="reference_pixel_size", type=float,
-        help="reference voxel size in Angstrom; defaults to its MRC header",
-    )
-    parser.add_argument(
-        "--search-lowpass", "--lowpass", dest="search_lowpass", type=float,
-        default=postprocessing.DEFAULT_ALIGNMENT_LOWPASS,
-        help=("low-pass resolution used for the global orientation search; "
-              "a low/intermediate-frequency refinement then estimates scale "
-              "and translation; the evaluation map receives no low-pass or "
-              "support mask"),
-    )
-    parser.add_argument(
-        "--allow-sign", action=argparse.BooleanOptionalAction, default=False,
-        help="also test the globally sign-flipped reconstruction",
-    )
-    parser.add_argument("--label", default="reconstruction")
-    return parser
-
-
-def align_main(argv: list[str] | None = None) -> int:
-    args = _align_parser().parse_args(argv)
-    if not np.isfinite(args.search_lowpass) or args.search_lowpass <= 0:
-        raise ValueError("--search-lowpass must be finite and positive")
-    for value, name in ((args.pixel_size, "--voxel-size"),
-                        (args.reference_pixel_size, "--reference-voxel-size")):
-        if value is not None and (not np.isfinite(value) or value <= 0):
-            raise ValueError(f"{name} must be finite and positive")
-    report = postprocessing.align_map_to_reference(
-        args.map_path,
-        args.reference_map,
-        args.output_dir,
-        args.search_lowpass,
-        allow_sign=args.allow_sign,
-        label=args.label,
-        pixel_size=args.pixel_size,
-        reference_pixel_size=args.reference_pixel_size,
-    )
-    print(json.dumps(report, indent=2), flush=True)
-    return 0
-
 
 def _latest_completed_relion_job(relion_dir: Path) -> tuple[Path, Path, Path]:
     """Return the latest job's original MoM initializer and final map."""
@@ -2205,32 +1333,18 @@ def _latest_completed_relion_job(relion_dir: Path) -> tuple[Path, Path, Path]:
         match = re.fullmatch(r"job_(\d+)", job.name)
         if match is None or not job.is_dir():
             continue
+        final = job / "run_class001.mrc"
+        if not final.is_file():
+            continue
         # initial_model.mrc is the Fourier-upsampled MoM map supplied to RELION.
         # Prefer the original coarse MoM source so alignment can preserve its
         # bandlimit explicitly. Fall back to the upsampled copy only when the
         # original source is no longer accessible.
         initial = job / "inputs/initial_model.mrc"
-        provenance_path = job / "inputs/provenance.json"
-        try:
-            provenance = _read_json(provenance_path)
-            if provenance.get("control"):
-                # Control runs: the "source" is a foreign deposited map that was
-                # resampled/cropped into the particle box; evaluate the actual
-                # initializer handed to RELION, not the deposited map.
-                raise ValueError("control initializer: use inputs/initial_model.mrc")
-            source = provenance.get("source", {})
-            source_map = Path(source.get("map", "")).expanduser()
-            if source_map and not source_map.is_absolute():
-                source_map = provenance_path.parent / source_map
-            expected_hash = source.get("map_sha256")
-            if (source_map.is_file() and isinstance(expected_hash, str)
-                    and _sha256(source_map) == expected_hash):
-                initial = source_map
-        except (OSError, ValueError, TypeError, AttributeError):
-            pass
-        final = job / "run_class001.mrc"
-        if initial.is_file() and final.is_file():
-            completed.append((int(match.group(1)), job, initial, final))
+        source = _read_json(job / "inputs/provenance.json")["source"]
+        if Path(source["map"]).is_file() and sha256_file(source["map"]) == source["map_sha256"]:
+            initial = Path(source["map"])
+        completed.append((int(match.group(1)), job, initial, final))
     if not completed:
         raise FileNotFoundError(
             f"no completed job in {relion_dir}: expected both "
@@ -2239,70 +1353,24 @@ def _latest_completed_relion_job(relion_dir: Path) -> tuple[Path, Path, Path]:
     return job.resolve(), initial.resolve(strict=True), final.resolve(strict=True)
 
 
-def _aligned_viewing_inputs(job, refined_map, mom_fit=None, relion_star=None):
-    """Find density inputs tied to the selected refinement's initializer."""
-    inputs = {"mom_fit": None, "relion_star": None}
+def _aligned_viewing_inputs(job, refined_map):
+    """The MoM fit that made the initializer and the final particle STAR of the refinement, or the reason one is missing."""
+    provenance = _read_json(job / "inputs/provenance.json")
+    expected_hash = provenance["source"]["map_sha256"]
+    mom_fit = None
+    for source_map in (Path(provenance["source"]["map"]),
+                       Path(provenance["preparation_request"]["pipeline_dir"]) / "MoM/M3/recon.mrc"):
+        fit = source_map.with_name("fit.npz")
+        if source_map.is_file() and fit.is_file() and sha256_file(source_map) == expected_hash:
+            mom_fit = fit.resolve(strict=True)
+            break
+    relion_star = refined_map.with_name("run_data.star")
     reasons = []
-    for name, override in (("mom_fit", mom_fit), ("relion_star", relion_star)):
-        if override is not None:
-            path = Path(override).expanduser().resolve(strict=True)
-            if not path.is_file():
-                raise ValueError(f"--{name.replace('_', '-')} must be a file: {path}")
-            inputs[name] = path
-
-    provenance_path = job / "inputs/provenance.json"
-    if inputs["mom_fit"] is None:
-        try:
-            provenance = _read_json(provenance_path)
-            source = provenance.get("source", {})
-            expected_hash = source.get("map_sha256")
-            if not isinstance(expected_hash, str) or not expected_hash:
-                reasons.append("initializer provenance lacks the source-map checksum")
-            else:
-                candidates = []
-                if source.get("map"):
-                    source_map = Path(source["map"]).expanduser()
-                    if not source_map.is_absolute():
-                        source_map = provenance_path.parent / source_map
-                    candidates.append(source_map)
-                pipeline_dir = provenance.get("preparation_request", {}).get(
-                    "pipeline_dir")
-                if pipeline_dir:
-                    pipeline = Path(pipeline_dir).expanduser()
-                    if not pipeline.is_absolute():
-                        pipeline = provenance_path.parent / pipeline
-                    candidates.append(pipeline / "MoM/M3/recon.mrc")
-                for source_map in candidates:
-                    fit = source_map.with_name("fit.npz")
-                    if (source_map.is_file() and fit.is_file()
-                            and _sha256(source_map) == expected_hash):
-                        inputs["mom_fit"] = fit.resolve(strict=True)
-                        inputs["initializer_source_map"] = str(
-                            source_map.resolve(strict=True))
-                        inputs["initializer_source_map_sha256"] = expected_hash
-                        break
-                if inputs["mom_fit"] is None:
-                    reasons.append(
-                        "no MoM fit accompanies a source map matching the "
-                        "initializer provenance checksum")
-        except (OSError, ValueError, TypeError, AttributeError) as error:
-            reasons.append(f"cannot read initializer provenance: {error}")
-
-    if inputs["relion_star"] is None:
-        suffix = "_class001.mrc"
-        name = refined_map.name
-        if name.endswith(suffix):
-            candidate = refined_map.with_name(name[:-len(suffix)] + "_data.star")
-            if candidate.is_file():
-                inputs["relion_star"] = candidate.resolve(strict=True)
-        if inputs["relion_star"] is None:
-            reasons.append("final RELION particle STAR is missing beside the refined map")
-    inputs["provenance"] = str(provenance_path)
-    inputs["overrides"] = {
-        "mom_fit": mom_fit is not None, "relion_star": relion_star is not None,
-    }
-    inputs["skip_reason"] = "; ".join(reasons) if reasons else None
-    return inputs
+    if mom_fit is None:
+        reasons.append("no MoM fit accompanies a source map matching the initializer provenance checksum")
+    if not relion_star.is_file():
+        reasons.append("final RELION particle STAR is missing beside the refined map")
+    return {"mom_fit": mom_fit, "relion_star": relion_star, "skip_reason": "; ".join(reasons) or None}
 
 
 def _align_reference_parser() -> argparse.ArgumentParser:
@@ -2313,7 +1381,7 @@ def _align_reference_parser() -> argparse.ArgumentParser:
                      "compare viewing distributions in reference coordinates "
                      "when the MoM fit and final particle poses are available. "
                      "The initial comparison uses the original coarse MoM map "
-                     "when provenance permits, otherwise the unmasked, "
+                     "when it is still accessible, otherwise the unmasked, "
                      "non-low-pass Fourier-upsampled initializer."),
         allow_abbrev=False,
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -2321,30 +1389,22 @@ def _align_reference_parser() -> argparse.ArgumentParser:
     parser.add_argument("--relion-dir", type=Path, required=True)
     parser.add_argument("--reference-map", type=Path, required=True)
     parser.add_argument(
-        "--mom-fit", type=Path,
-        help="override the MoM fit.npz inferred from initializer provenance for viewing-density comparison",
-    )
-    parser.add_argument(
-        "--relion-star", type=Path,
-        help="override the final particle STAR used for the aligned viewing-density comparison",
-    )
-    parser.add_argument(
-        "--outdir", "-o", "--output-dir", dest="output_dir", type=Path,
+        "--outdir", dest="output_dir", type=Path,
         help=("comparison output directory; defaults to the dataset's "
               "align_reference directory"),
     )
     parser.add_argument(
-        "--voxel-size", "--pixel-size", dest="pixel_size", type=float,
+        "--voxel-size", dest="pixel_size", type=float,
         help=("voxel size in Angstrom for both initial and refined maps; "
               "defaults to each map's MRC header"),
     )
     parser.add_argument(
-        "--reference-voxel-size", "--reference-pixel-size",
+        "--reference-voxel-size", 
         dest="reference_pixel_size", type=float,
         help="reference voxel size in Angstrom; defaults to its MRC header",
     )
     parser.add_argument(
-        "--search-lowpass", "--lowpass", dest="search_lowpass", type=float,
+        "--search-lowpass", dest="search_lowpass", type=float,
         default=postprocessing.DEFAULT_ALIGNMENT_LOWPASS,
         help=("low-pass resolution used for the initial map's global "
               "orientation search; a low/intermediate-frequency refinement "
@@ -2372,36 +1432,14 @@ def align_reference_main(argv: list[str] | None = None) -> int:
     """Align maps, compute FSCs, and optionally compare aligned viewing densities."""
     started = time.monotonic()
     args = _align_reference_parser().parse_args(argv)
-    if not np.isfinite(args.search_lowpass) or args.search_lowpass <= 0:
-        raise ValueError("--search-lowpass must be finite and positive")
     refined_lowpasses = tuple(dict.fromkeys(
         float(value) for value in args.refined_search_lowpass))
-    if not refined_lowpasses or any(
-            not np.isfinite(value) or value <= 0
-            for value in refined_lowpasses):
-        raise ValueError(
-            "--refined-search-lowpass values must be finite and positive")
-    for value, name in ((args.pixel_size, "--voxel-size"),
-                        (args.reference_pixel_size, "--reference-voxel-size")):
-        if value is not None and (not np.isfinite(value) or value <= 0):
-            raise ValueError(f"{name} must be finite and positive")
     relion_dir = args.relion_dir.expanduser().resolve(strict=True)
-    if not relion_dir.is_dir():
-        raise NotADirectoryError(relion_dir)
     reference_map = args.reference_map.expanduser().resolve(strict=True)
     job, initial_map, refined_map = _latest_completed_relion_job(relion_dir)
-    viewing_inputs = _aligned_viewing_inputs(
-        job, refined_map, args.mom_fit, args.relion_star)
-    if args.output_dir is not None:
-        output = args.output_dir.expanduser().resolve()
-    elif relion_dir.name in {"relion_refine", "Relion"}:
-        output = relion_dir.parent / "align_reference"
-    else:
-        legacy = re.fullmatch(r"Relion_(\d+)", relion_dir.name)
-        output = (
-            relion_dir.parent / legacy.group(1) / "align_reference"
-            if legacy is not None else relion_dir.parent / "align_reference"
-        )
+    viewing_inputs = _aligned_viewing_inputs(job, refined_map)
+    output = (args.output_dir.expanduser().resolve() if args.output_dir is not None
+              else relion_dir.parent / "align_reference")
     if output.exists() and any(output.iterdir()):
         raise FileExistsError(
             f"Reference comparison directory must be new or empty: {output}")
@@ -2490,10 +1528,6 @@ def align_reference_main(argv: list[str] | None = None) -> int:
         viewing = postprocessing.plot_aligned_viewing_distributions(
             viewing_inputs["mom_fit"], viewing_inputs["relion_star"],
             initial, refined, output)
-    viewing["input_discovery"] = {
-        name: str(value) if isinstance(value, Path) else value
-        for name, value in viewing_inputs.items()
-    }
     viewing_seconds = time.monotonic() - viewing_started
     postprocess_report = relion_dir.parent / "postprocess" / \
         "postprocess_report.json"
@@ -2539,228 +1573,8 @@ def align_reference_main(argv: list[str] | None = None) -> int:
 
 
 # ===========================================================================
-# Prepared-moments M2+M3 reconstruction (was reconstruct_prepared.py)
+# RELION refinement
 # ===========================================================================
-
-REPORT_NAME = "reconstruction_report.json"
-
-
-def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _finite_nonnegative(value: object, context: str) -> float:
-    if (isinstance(value, bool) or not isinstance(value, (int, float))
-            or not math.isfinite(float(value)) or float(value) < 0.0):
-        raise ValueError(f"{context} must be finite and nonnegative")
-    return float(value)
-
-
-def _stage_report(result, wall_seconds: float) -> dict:
-    summary_path = result.summary_path.resolve(strict=True)
-    summary = _read_json(summary_path)
-    if not summary.get("complete") or not summary.get("fit_complete"):
-        raise RuntimeError(f"incomplete reconstruction summary: {summary_path}")
-    child_elapsed = _finite_nonnegative(
-        summary["elapsed_seconds"], f"{summary_path}: elapsed_seconds")
-    child_timings = summary.get("timings_seconds")
-    if not isinstance(child_timings, dict):
-        raise ValueError(f"{summary_path} lacks timings_seconds")
-    for name, value in child_timings.items():
-        _finite_nonnegative(value, f"{summary_path}: timings_seconds.{name}")
-    return {
-        "order": int(result.order),
-        "best_init": int(result.best_init),
-        "objective": float(result.objective),
-        "relative_moment_error": float(result.relative_moment_error),
-        "summary_path": str(summary_path),
-        "timing_path": str(summary_path),
-        "timing_json_key": "timings_seconds",
-        "fit_path": str(result.fit_path.resolve(strict=True)),
-        "reconstruction_path": str(
-            result.reconstruction_path.resolve(strict=True)),
-        "wall_seconds_this_invocation": _finite_nonnegative(
-            wall_seconds, "stage wall time"),
-        "child_elapsed_seconds_this_invocation": child_elapsed,
-        "child_timings_seconds": child_timings,
-    }
-
-
-def _reconstruct_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description=__doc__, allow_abbrev=False,
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    parser.add_argument("--prepared-dir", type=Path, required=True)
-    parser.add_argument("--outdir", "-o", "--output-dir", dest="output_dir",
-                        type=Path, required=True)
-    parser.add_argument("--vol-degree", dest="ell_max", metavar="VOL_DEGREE",
-                        type=int, default=postprocessing.DEFAULT_ELL_MAX)
-    parser.add_argument(
-        "--viewing-degree", type=int, choices=(0, 2, 4),
-        default=postprocessing.DEFAULT_VIEWING_DEGREE,
-    )
-    parser.add_argument(
-        "--sphere-nodes", type=int, default=postprocessing.DEFAULT_SPHERE_NODES)
-    parser.add_argument(
-        "--sphere-degree", default="auto",
-        help=("select the smallest positive-weight quadrature of this degree; "
-              "'auto' (the default) uses 3*vol_degree + viewing_degree, the "
-              "exactness requirement of the M3 model, and 'none' selects by "
-              "--sphere-nodes instead"))
-    parser.add_argument("--n-init", type=int, default=postprocessing.DEFAULT_N_INIT)
-    parser.add_argument("--maxiter", type=int, default=postprocessing.DEFAULT_MAXITER)
-    parser.add_argument("--device", choices=("cpu", "gpu"), default="gpu")
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--print-every", type=int, default=100)
-    _add_shift_arguments(parser)
-    parser.add_argument(
-        "--resume", action="store_true",
-        help="resume compatible partial outputs; otherwise output must be empty",
-    )
-    return parser
-
-
-def _add_shift_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument(
-        "--shift-distribution", action=argparse.BooleanOptionalAction, default=True,
-        help=("model the per-image shifts that remain after the common-shift correction by an isotropic radial distribution on rings, "
-              "fitted jointly with the volume and the viewing density in each of the M1, M2 and M3 stages (see kam.shift_distribution); "
-              "enabled by default"))
-    parser.add_argument(
-        "--shift-step-px", type=float, default=0.25,
-        help="spacing of the shift rings in moment-grid pixels (sub-pixel allowed)")
-    parser.add_argument(
-        "--shift-max-px", type=float, default=None,
-        help=("largest ring radius in moment-grid pixels (default: a quarter of the radius of the "
-              "downsampled moment images, i.e. side / 8)"))
-
-
-def _shift_settings(args: argparse.Namespace, prepared_dir: Path) -> dict | None:
-    """Ring grid of the shift distribution, or None when it is switched off."""
-    if not args.shift_distribution:
-        return None
-    with np.load(Path(prepared_dir) / "moments.npz") as saved:
-        side = int(saved["ds_res"])
-    max_px = side / 8 if args.shift_max_px is None else args.shift_max_px
-    return dict(step_px=args.shift_step_px, max_px=max_px, orders=[1, 2, 3])
-
-
-def _check_shift_settings(output_dir: Path, wanted: dict | None) -> None:
-    """Never resume (or mix) outputs fitted with a different shift-distribution setting."""
-    path = output_dir / "shift_distribution_settings.json"
-    saved = json.loads(path.read_text()) if path.is_file() else None
-    if saved != wanted and (saved is not None or any((output_dir / f"M{k}").exists() for k in (1, 2, 3))):
-        raise ValueError(
-            f"{output_dir} was produced with shift setting {saved}, not {wanted}; use a new output directory")
-    if wanted is not None and saved is None:
-        path.write_text(json.dumps(wanted) + "\n")
-
-
-def reconstruct_prepared_main(argv: list[str] | None = None) -> int:
-    parser = _reconstruct_parser()
-    args = parser.parse_args(argv)
-    _resolve_sphere_degree(parser, args)
-    prepared_dir = args.prepared_dir.expanduser().resolve(strict=True)
-    if not (prepared_dir / "moments.npz").is_file():
-        raise FileNotFoundError(f"missing {prepared_dir / 'moments.npz'}")
-    output_dir = args.output_dir.expanduser().resolve()
-    nonempty = output_dir.exists() and any(output_dir.iterdir())
-    if nonempty and not args.resume:
-        raise FileExistsError(
-            f"{output_dir} is nonempty; choose a new directory or use --resume")
-    output_dir.mkdir(parents=True, exist_ok=True)
-    shift = _shift_settings(args, prepared_dir)
-    _check_shift_settings(output_dir, shift)
-    m1_dir = output_dir / "M1"
-    m2_dir = output_dir / "M2"
-    m3_dir = output_dir / "M3"
-
-    common = dict(
-        prepared_dir=prepared_dir,
-        ell_max=args.ell_max,
-        viewing_degree=args.viewing_degree,
-        sphere_nodes=args.sphere_nodes,
-        sphere_degree=args.sphere_degree,
-        n_init=args.n_init,
-        maxiter=args.maxiter,
-        device=args.device,
-        print_every=args.print_every,
-        seed=args.seed,
-        resume=args.resume,
-    )
-    # Sequential matching as in the paper: M1 first, each stage
-    # warm-starting the next.
-    m1_config = ReconstructionConfig(
-        output_dir=m1_dir, order=1, initial_fit=None, **common)
-    m2_config = ReconstructionConfig(
-        output_dir=m2_dir, order=2, initial_fit=m1_dir, **common)
-    m3_config = ReconstructionConfig(
-        output_dir=m3_dir, order=3, initial_fit=m2_dir, **common)
-
-    started_utc = _utc_now()
-    started = time.monotonic()
-    results, walls, warm = {}, {}, None
-    for order, config_k, directory in ((1, m1_config, m1_dir), (2, m2_config, m2_dir), (3, m3_config, m3_dir)):
-        stage_started = time.monotonic()
-        if shift is None:
-            results[order] = reconstruct_single_moment(config_k)
-        else:
-            from . import shift_distribution
-            with shift_distribution.shift_law(
-                    shift["step_px"], shift["max_px"], warm=[r["d"] for r in warm or []]) as law:
-                results[order] = reconstruct_single_moment(config_k)
-            shift_distribution.write_records(law, directory / "shift_distribution.json")
-            warm = law.records
-        walls[order] = time.monotonic() - stage_started
-    m1_result, m2_result, m3_result = results[1], results[2], results[3]
-    m1_wall, m2_wall, m3_wall = walls[1], walls[2], walls[3]
-    total = time.monotonic() - started
-
-    stages = {
-        "m1": _stage_report(m1_result, m1_wall),
-        "m2": _stage_report(m2_result, m2_wall),
-        "m3": _stage_report(m3_result, m3_wall),
-    }
-    child_wall_sum = m1_wall + m2_wall + m3_wall
-    report = {
-        "schema_version": 1,
-        "workflow": "prepared_moments_m2_then_m3",
-        "complete": True,
-        "started_utc": started_utc,
-        "finished_utc": _utc_now(),
-        "configuration": {
-            "prepared_dir": str(prepared_dir),
-            "output_dir": str(output_dir),
-            "ell_max": args.ell_max,
-            "viewing_degree": args.viewing_degree,
-            "sphere_nodes": args.sphere_nodes,
-            "sphere_degree": args.sphere_degree,
-            "n_inplane": 1,
-            "n_init": args.n_init,
-            "maxiter": args.maxiter,
-            "device": args.device,
-            "seed": args.seed,
-            "print_every": args.print_every,
-            "resume": args.resume,
-            "m3_initialization": (
-                "M1 warm-starts M2; M2 init_i warm-starts M3 init_i"),
-        },
-        "stages": stages,
-        "timings_seconds": {
-            "m1_wall_this_invocation": m1_wall,
-            "m2_wall_this_invocation": m2_wall,
-            "m3_wall_this_invocation": m3_wall,
-            "child_stage_wall_sum": child_wall_sum,
-            "orchestration_overhead": max(0.0, total - child_wall_sum),
-            "total_this_invocation": total,
-        },
-    }
-    _write_json_atomic(output_dir / REPORT_NAME, report)
-    print(f"Wrote {output_dir / REPORT_NAME}", flush=True)
-    return 0
-
-
 
 def relion_prepare_main(argv=None):
     """Delegate to the RELION preparation module."""
@@ -2776,14 +1590,66 @@ def postprocess_main(argv=None):
     return relion_prepare.postprocess_main(argv)
 
 
+def _reconstruct_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="kam reconstruct", allow_abbrev=False, formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        description=("MoM ab initio map from a stack of denoised particle images: the moment and M1 -> M2 -> M3 stages of "
+                     "kam pipeline without denoising and selection. The map is OUTDIR/M3/recon.mrc."))
+    parser.add_argument("stack", type=Path, help="MRC stack of square denoised images; the pixel size is read from its header")
+    parser.add_argument("--outdir", type=Path, required=True, help="new output directory")
+    parser.add_argument("--moment-res", type=int, help="side of the moment images (default: the side of the stack)")
+    parser.add_argument("--vol-degree", dest="ell_max", metavar="VOL_DEGREE", type=int, default=DEFAULT_ELL_MAX,
+                        help="maximum SphFB angular degree of the volume")
+    parser.add_argument("--viewing-degree", type=int, choices=(0, 2, 4), default=DEFAULT_VIEWING_DEGREE,
+                        help="degree of the positive spherical-harmonic viewing density")
+    parser.add_argument("--symmetry", default="C1", help="point group of the molecule (C1, Cn, Dn, T, O or I)")
+    parser.add_argument("--shift-step-px", type=float, default=DEFAULT_SHIFT_STEP_PX,
+                        help="ring spacing of the fitted shift distribution, in moment-grid pixels")
+    parser.add_argument("--shift-max-px", type=float, default=None,
+                        help="largest ring radius in moment-grid pixels (default: side / 8)")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--device", choices=("cpu", "gpu"), default="gpu")
+    parser.add_argument("--batch-size", type=int, default=256)
+    return parser
+
+
+def reconstruct_main(argv=None):
+    from .moments import use_device
+
+    args = _reconstruct_parser().parse_args(argv)
+    with mrcfile.open(args.stack, permissive=True) as handle:
+        images = np.asarray(handle.data, dtype=np.float32)
+        pixel = float(handle.voxel_size.x)
+    args.moment_res = images.shape[-1] if args.moment_res is None else args.moment_res
+    root = args.outdir.resolve()
+    use_device(args.device)
+    print(f"[reconstruct] {len(images)} images of {images.shape[-1]} px at {pixel:.4g} A -> moments on {args.moment_res} px", flush=True)
+    postprocessing.prepare_moments_from_images(
+        images, pixel, root / "prepared", moment_res=args.moment_res, ell_max=args.ell_max, batch_size=args.batch_size,
+        dataset=args.stack.stem, source=args.stack.resolve())
+    del images
+    from . import shift_distribution
+
+    for order in (1, 2, 3):
+        if order == 3:
+            shift_distribution.select_m2_start(root / "prepared", root / "M2", root / "M2_selected", ell_max=args.ell_max,
+                                               viewing_degree=args.viewing_degree, symmetry=args.symmetry, device=args.device)
+        print(f"[reconstruct] M{order}", flush=True)
+        _reconstruct_order(ReconstructionConfig(
+            prepared_dir=root / "prepared", output_dir=root / f"M{order}", order=order,
+            ell_max=args.ell_max, viewing_degree=args.viewing_degree, symmetry=args.symmetry,
+            n_init=1 if order == 3 else N_INIT, maxiter=_maxiter(order), device=args.device, seed=args.seed,
+            initial_fit={1: None, 2: root / "M1", 3: root / "M2_selected"}[order],
+        ), _shift_settings(args, args.moment_res))
+    print(f"[reconstruct] map: {root / 'M3' / 'recon.mrc'}", flush=True)
+    return 0
+
 COMMANDS = {
     "pipeline": pipeline_main,
+    "reconstruct": reconstruct_main,
     "align_reference": align_reference_main,
     "denoise": denoise_main,
     "select": select_main,
-    "align": align_main,
-    "align3d": align_reference_main,
-    "reconstruct-prepared": reconstruct_prepared_main,
     "relion_prepare": relion_prepare_main,
     "postprocess": postprocess_main,
 }

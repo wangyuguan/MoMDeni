@@ -1,105 +1,10 @@
-"""Fourier--Bessel moment matching and SphFB volume reconstruction.
-
-The objective combines Fourier--Bessel M1, M2, and M3 block residuals.
-Block weights preserve complete-tensor Frobenius norms. Volume
-coefficients and a viewing distribution are optimized against one active
-moment order.
-"""
+"""Real spherical Fourier--Bessel (SphFB) volume parameterization and its projection operator."""
 
 import numpy as np
 from . import utils
 from scipy.special import spherical_jn
-from scipy.optimize import brentq
-from .moments import (
-    centered_ifftn, DEFAULT_BATCH, centered_coords_1d,
-    _iter_batches, _on_gpu,
-)
-
-
-def apply_fourier_image_shifts(images, offsets, ds_res, support=None,
-                               batch_size=DEFAULT_BATCH):
-    """Apply real-space translations to Fourier images in place.
-
-    The phase is ``exp(-2*pi*i*k.dot(offset))``, where frequencies are in
-    cycles per pixel and ``offsets`` has shape ``(N, 2)`` in downsampled-pixel
-    units. ``images`` has shape ``(N, ds_res, ds_res)`` or ``(N, d)``. For the
-    flattened form, ``support`` contains the retained Fortran-order pixel
-    indices. The input array is returned after mutation.
-    """
-    images = np.asarray(images)
-    offsets = np.asarray(offsets, dtype=float)
-    if images.ndim not in (2, 3):
-        raise ValueError("images must have shape (N,d) or (N,ds_res,ds_res)")
-    if offsets.shape != (len(images), 2) or not np.all(np.isfinite(offsets)):
-        raise ValueError("offsets must be a finite (N,2) array")
-    if not np.issubdtype(images.dtype, np.complexfloating):
-        raise TypeError("Fourier images must have a complex dtype")
-    if batch_size is not None and batch_size < 1:
-        raise ValueError("batch_size must be positive")
-    c = centered_coords_1d(ds_res) / float(ds_res)
-    kx, ky = np.meshgrid(c, c, indexing="ij")
-    freq = np.column_stack((kx.ravel(order="F"), ky.ravel(order="F")))
-    if images.ndim == 3:
-        if images.shape[1:] != (ds_res, ds_res) or support is not None:
-            raise ValueError("full images must match ds_res and omit support")
-    else:
-        if support is not None:
-            freq = freq[np.asarray(support, dtype=int)]
-        if images.shape[1] != len(freq):
-            raise ValueError("flattened image width does not match ds_res/support")
-    for sl in _iter_batches(len(images), batch_size):
-        phase = np.exp(-2j * np.pi * (offsets[sl] @ freq.T))
-        if images.ndim == 3:
-            phase = phase.reshape(-1, ds_res, ds_res, order="F")
-        images[sl] *= phase
-    return images
-
-
-def _validate_contrast_scales(contrast_scales, n_orders):
-    """Return one finite positive contrast multiplier per moment order."""
-    if contrast_scales is None:
-        return np.ones(n_orders, dtype=float)
-    scales = np.asarray(contrast_scales, dtype=float)
-    if (scales.shape != (n_orders,) or not np.all(np.isfinite(scales))
-            or np.any(scales <= 0)):
-        raise ValueError(
-            f"contrast_scales must contain {n_orders} finite positive values")
-    return scales
-
-
-def _validate_lambdas(lambdas, targets):
-    """Validate M1--M3 loss weights and structural weight arrays.
-
-    Each ``lambdas[k]`` must be a scalar or shaped like ``targets[k]``.
-    Arrays encode excluded entries and compressed-symmetry multiplicities.
-    The validated weights are returned as a list because their shapes differ.
-    """
-    if len(lambdas) != len(targets):
-        raise ValueError(
-            f"lambdas must contain {len(targets)} entries, one per moment order")
-    weights = []
-    for k, (w, target) in enumerate(zip(lambdas, targets)):
-        w = np.asarray(w, dtype=float)
-        if w.shape not in ((), np.shape(target)):
-            raise ValueError(f"m{k+1} weight must be scalar or shaped like m{k+1}")
-        if not np.all(np.isfinite(w)) or np.any(w < 0):
-            raise ValueError(f"m{k+1} weight must be finite and nonnegative")
-        weights.append(w)
-    return weights
-
-
-def joint_objective_and_grad(theta, p, param, grid, mbar1, mbar2, mbar3,
-                             lambdas=None, return_info=False,
-                             contrast_scales=None, reflection_augmented=False):
-    """Evaluate the Fourier--Bessel M1--M3 loss and its gradients."""
-    from .moments import fb_objective_and_grad
-
-    if getattr(param, "fb_basis", None) is None:
-        raise ValueError("moment matching requires a Fourier-Bessel basis")
-    return fb_objective_and_grad(
-        theta, p, param, grid, mbar1, mbar2, mbar3, lambdas=lambdas,
-        return_info=return_info, contrast_scales=contrast_scales,
-        reflection_augmented=reflection_augmented)
+from scipy.optimize import brentq, minimize
+from .moments import centered_coords_1d, centered_ifftn, _on_gpu
 
 
 def _norm_assoc_legendre_all(nmax, x):
@@ -143,15 +48,61 @@ def _wigner_d(j, alpha, beta, gamma):
     return D
 
 
+
+def _small_d(j, betas):
+    """Real factor (-1)^(mp-m) d^j_{mp m}(beta) of ``_wigner_d`` for an array of beta: shape (len(betas), 2j+1, 2j+1)."""
+    fact = np.cumprod(np.r_[1.0, np.arange(1, 2 * j + 1)])
+    c, s = np.cos(betas / 2), np.sin(betas / 2)
+    out = np.zeros((len(betas), 2 * j + 1, 2 * j + 1))
+    for mp in range(-j, j + 1):
+        for m in range(-j, j + 1):
+            scale = np.sqrt(fact[j + mp] * fact[j - mp] * fact[j + m] * fact[j - m])
+            for k in range(max(0, m - mp), min(j + m, j - mp) + 1):
+                den = fact[j + m - k] * fact[mp - m + k] * fact[j - mp - k] * fact[k]
+                out[:, mp + j, m + j] += (-1.0) ** (mp - m + k) * scale / den * c ** (2 * j + m - mp - 2 * k) * s ** (mp - m + 2 * k)
+    return out
+
+
+def align_coefficients(target, moving, n_beta=90, n_angle=180):
+    """Rotate (and possibly reflect) the complex SphFB coefficient blocks ``moving`` ({ell: (k, 2 ell + 1)}) onto ``target``.
+
+    A rotation acts as A_ell -> A_ell conj(D_ell) (W_ell = conj(D_ell)^T, as in ``SphFBParam._rotated_coefficients``), so the inner product
+    c(R) = Re sum_ell sum_{m,n} W_ell[m, n] C_ell[m, n] with C_ell = T_ell^H M_ell is a 2-D Fourier series in (alpha, gamma) for every beta:
+    one FFT per beta on an n_beta x n_angle x n_angle grid, then Nelder-Mead from the grid maximum. A reflection is the inversion
+    (A_ell times (-1)^ell) composed with a rotation. Returns the aligned blocks, the ZYZ angles, whether reflected and c."""
+    betas = (np.arange(n_beta) + 0.5) * np.pi / n_beta
+    dd = {ell: _small_d(ell, betas) for ell in target}
+    best = None
+    for reflected in (False, True):
+        moved = {ell: (-1.0) ** ell * block for ell, block in moving.items()} if reflected else moving
+        C = {ell: np.conj(target[ell]).T @ moved[ell] for ell in target}
+        G = np.zeros((n_beta, n_angle, n_angle), dtype=np.complex128)        # G[beta, n mod n_angle, m mod n_angle]
+        for ell in C:
+            r = np.arange(-ell, ell + 1) % n_angle
+            G[:, r[:, None], r[None, :]] += dd[ell] * C[ell].T[None]
+        grid = np.real(np.fft.ifft2(G, axes=(1, 2)))
+        ib, ia, ig = np.unravel_index(np.argmax(grid), grid.shape)
+
+        def negative(x):
+            return -sum(np.real(np.sum(np.conj(_wigner_d(ell, *x)).T * C[ell])) for ell in C)
+
+        res = minimize(negative, [2 * np.pi * ia / n_angle, betas[ib], 2 * np.pi * ig / n_angle], method="Nelder-Mead",
+                       options=dict(xatol=1e-6, fatol=1e-12, maxiter=2000))
+        if best is None or -res.fun > best[3]:
+            best = (moved, res.x, reflected, -res.fun)
+    moved, angles, reflected, value = best
+    return {ell: moved[ell] @ np.conj(_wigner_d(ell, *angles)) for ell in moved}, angles, reflected, value
+
 def _rot_to_zyz(R):
     """Return angles for R = Rz(alpha) Ry(beta) Rz(gamma)."""
-    beta = np.arccos(np.clip(R[2, 2], -1.0, 1.0))
-    if abs(np.sin(beta)) > 1e-10:
+    if np.hypot(R[0, 2], R[1, 2]) > 1e-10:
+        beta = np.arccos(np.clip(R[2, 2], -1.0, 1.0))
         alpha = np.arctan2(R[1, 2], R[0, 2])
         gamma = np.arctan2(R[2, 1], -R[2, 0])
-    else:
-        alpha = np.arctan2(R[1, 0], R[0, 0])
-        gamma = 0.0
+    elif R[2, 2] > 0:      # gimbal lock, beta = 0: R depends only on alpha + gamma
+        beta, alpha, gamma = 0.0, np.arctan2(R[1, 0], R[0, 0]), 0.0
+    else:                  # gimbal lock, beta = pi: R depends only on alpha - gamma
+        beta, alpha, gamma = np.pi, np.arctan2(-R[1, 0], R[1, 1]), 0.0
     return alpha, beta, gamma
 
 
@@ -187,20 +138,6 @@ def _radial_truncation(ell_max, n):
     return np.asarray(kmax, dtype=int), roots
 
 
-def _image_support(L, support):
-    """Validate integer indices into the Fortran-flattened ``L x L`` image."""
-    if support is None:
-        return np.arange(L * L)
-    support = np.asarray(support)
-    # A boolean pixel mask would otherwise be read as the indices 0 and 1.
-    if not np.issubdtype(support.dtype, np.integer):
-        raise ValueError("support must be an integer index array, not a mask")
-    if (support.ndim != 1 or support.size == 0
-            or support.min() < 0 or support.max() >= L * L):
-        raise ValueError("support must index pixels of the L x L image grid")
-    return support.astype(int)
-
-
 def _real_to_complex(ell_max, kmax, indices):
     n = len(indices)
     S = np.zeros((n, n), dtype=np.complex128)
@@ -222,27 +159,20 @@ def _real_to_complex(ell_max, kmax, indices):
 class SphFBParam:
     """Real spherical Fourier--Bessel parameterization and projection operator.
 
-    Factors are precomputed for a fixed ``SO(3)`` grid and image support.
-    ``forward_images`` and ``adjoint_images`` are a real-linear adjoint pair and
-    map between coefficient vectors and Fourier-image samples.
+    With ``fb_basis`` (:class:`moments.FBMomentBasis`), factors are precomputed for the fixed viewing rotations ``rots``
+    and ``forward_images`` and ``adjoint_images`` are a real-linear adjoint pair between coefficient vectors and the
+    steerable FB coefficients of the projections. Without it only the SphFB index layout is built.
+
+    ``symmetry`` names a point group (see :mod:`kam.symmetry`). Then the volume coefficients are restricted to the symmetric subspace
+    ``theta = basis @ phi`` (``basis`` is ``None`` for ``C1``, i.e. no restriction).
     """
 
-    def __init__(self, L, ell_max, rots, support=None, dtype=np.complex128,
-                 fb_basis=None):
+    def __init__(self, L, ell_max, rots, fb_basis=None, symmetry="C1"):
         self.L = int(L)
         self.r_max = self.L / 2.0 - 1.0 if self.L % 2 == 0 else (self.L - 1) / 2
         self.ell_max = int(ell_max)
         self.rots = np.asarray(rots)
-        # With ``fb_basis`` (:class:`moments.FBMomentBasis`), "images" are
-        # steerable FB coefficients and ``support`` indexes those coefficients.
         self.fb_basis = fb_basis
-        if fb_basis is None:
-            self.support = _image_support(self.L, support)
-        elif support is not None:
-            raise ValueError("FB coefficient images do not take a pixel support")
-        else:
-            self.support = np.arange(fb_basis.n_coefficients)
-        self.dtype = np.dtype(dtype)
 
         self.k_max, self.r0 = _radial_truncation(self.ell_max, self.L)
         self.ell_max = min(self.ell_max, len(self.k_max) - 1)
@@ -254,7 +184,7 @@ class SphFBParam:
                     self.indices[(ell, k, m)] = q
                     q += 1
         self.n_params = q
-        self.S = _real_to_complex(self.ell_max, self.k_max, self.indices).astype(dtype)
+        self.S = _real_to_complex(self.ell_max, self.k_max, self.indices)
         self._blocks = {
             ell: np.stack([
                 np.arange(self.indices[(ell, k, -ell)],
@@ -262,19 +192,26 @@ class SphFBParam:
                 for k in range(self.k_max[ell])
             ]) for ell in range(self.ell_max + 1)
         }
-        if fb_basis is None:
-            self.B = self._basis_on_slice().astype(dtype)
-        else:
-            self.B = fb_basis.slice_projection(self).astype(dtype)
-        self.W = self._rotation_blocks(dtype)
+        self.symmetry = symmetry
+        self.basis = None
+        if symmetry != "C1":
+            from .symmetry import invariant_basis
+            self.basis = invariant_basis(self, symmetry)
         self._cart_basis = None
         self._gpu_factors = None
-        if _on_gpu():
-            self._upload_gpu_factors()
+        if fb_basis is not None:
+            self.B = fb_basis.slice_projection(self)
+            self.W = self._rotation_blocks()
+            if _on_gpu():
+                self._upload_gpu_factors()
 
         c = centered_coords_1d(self.L)
         x, y, z = np.meshgrid(c, c, c, indexing="ij")
         self.ball_mask = np.sqrt(x*x + y*y + z*z) <= self.r_max
+
+    def project(self, theta):
+        """The coefficient vector of the symmetric subspace closest to ``theta`` (``theta`` itself for ``C1``)."""
+        return theta if self.basis is None else self.basis @ (self.basis.T @ theta)
 
     def _basis(self, x, y, z):
         """Evaluate the complex basis at normalized Fourier coordinates."""
@@ -305,24 +242,16 @@ class SphFBParam:
                 F[:, idx] = radial[:, None] * Y
         return F
 
-    def _basis_on_slice(self):
-        c = centered_coords_1d(self.L) / self.L
-        x, y = np.meshgrid(c, c, indexing="xy")
-        xf, yf = x.ravel(order="F"), y.ravel(order="F")
-        return self._basis(xf[self.support], yf[self.support],
-                           np.zeros(len(self.support)))
-
-    def _rotation_blocks(self, dtype):
+    def _rotation_blocks(self):
         out = {}
         angles = [_rot_to_zyz(R) for R in self.rots]
         for ell in range(self.ell_max + 1):
-            out[ell] = np.asarray([np.conj(_wigner_d(ell, *a)).T for a in angles],
-                                  dtype=dtype)
+            out[ell] = np.asarray([np.conj(_wigner_d(ell, *a)).T for a in angles])
         return out
 
     def _rotated_coefficients(self, theta):
         ac = self.S @ np.asarray(theta, dtype=self.S.real.dtype)
-        u = np.zeros((len(self.rots), self.n_params), dtype=self.dtype)
+        u = np.zeros((len(self.rots), self.n_params), dtype=np.complex128)
         for ell, idx in self._blocks.items():
             A = ac[idx]
             u[:, idx] = np.einsum("imn,kn->ikm", self.W[ell], A, optimize=True)
@@ -341,10 +270,6 @@ class SphFBParam:
                        for ell, idx in self._blocks.items()},
         }
 
-    @property
-    def projection_device(self):
-        return "gpu" if self._gpu_factors is not None else "cpu"
-
     def _forward_gpu(self, theta):
         torch = utils._gpu_torch()
         dev = utils._gpu_dev()
@@ -361,19 +286,17 @@ class SphFBParam:
         torch.cuda.synchronize()
         return out.cpu().numpy()
 
-    def forward_images(self, theta, rots=None, support=None):
-        self._check_operator(rots, support)
+    def forward_images(self, theta):
         if self._gpu_factors is not None:
             return self._forward_gpu(theta)
         return self._rotated_coefficients(theta) @ self.B.T
 
-    def adjoint_images(self, G, rots=None, support=None):
+    def adjoint_images(self, G):
         """Apply the real adjoint satisfying ``Re<G,F(dtheta)>=<out,dtheta>``."""
-        self._check_operator(rots, support)
         if self._gpu_factors is not None:
             return self._adjoint_gpu(G)
-        ubar = np.asarray(G, dtype=self.dtype) @ np.conj(self.B)
-        acbar = np.zeros(self.n_params, dtype=self.dtype)
+        ubar = np.asarray(G, dtype=np.complex128) @ np.conj(self.B)
+        acbar = np.zeros(self.n_params, dtype=np.complex128)
         for ell, idx in self._blocks.items():
             U = ubar[:, idx]
             Abar = np.einsum("imn,ikm->kn", np.conj(self.W[ell]), U,
@@ -397,34 +320,28 @@ class SphFBParam:
         torch.cuda.synchronize()
         return out.cpu().numpy().astype(float, copy=False)
 
-    def _check_operator(self, rots, support):
-        if rots is not None and (np.shape(rots) != np.shape(self.rots)
-                                 or not np.allclose(rots, self.rots)):
-            raise ValueError("SphFBParam is precomputed for a different rotation grid")
-        if support is not None and not np.array_equal(support, self.support):
-            raise ValueError("SphFBParam is precomputed for a different image support")
-
     def _cartesian_basis(self):
+        """Complex SphFB basis at the Cartesian Fourier points of the ball (cached); ``embed`` applies ``S`` to the coefficients,
+        which avoids the dense (points x params) @ (params x params) product (``S`` has at most two nonzeros per column)."""
         if self._cart_basis is None:
             c = centered_coords_1d(self.L) / self.L
             x, y, z = np.meshgrid(c, c, c, indexing="ij")
             mask = self.ball_mask.ravel()
-            self._cart_basis = self._basis(x.ravel()[mask], y.ravel()[mask],
-                                           z.ravel()[mask]) @ self.S
+            self._cart_basis = self._basis(x.ravel()[mask], y.ravel()[mask], z.ravel()[mask])
         return self._cart_basis
 
     def embed(self, theta):
-        V = np.zeros(self.L ** 3, dtype=np.complex128)
-        V[self.ball_mask.ravel()] = self._cartesian_basis() @ np.asarray(theta)
-        return V.reshape((self.L,) * 3)
+        return self._embed_coefficients(self.S @ np.asarray(theta))
 
-    def reduce(self, Vhat):
-        y = np.asarray(Vhat).ravel()[self.ball_mask.ravel()]
-        A = self._cartesian_basis()
-        # Hermitian targets constrain real coefficients through both components.
-        return np.linalg.lstsq(np.vstack((A.real, A.imag)),
-                               np.concatenate((y.real, y.imag)), rcond=1e-7)[0]
+    def _embed_coefficients(self, ac):
+        V = np.zeros(self.L ** 3, dtype=np.complex128)
+        V[self.ball_mask.ravel()] = self._cartesian_basis() @ ac
+        return V.reshape((self.L,) * 3)
 
     def volume(self, theta):
         """Return the real-space ``L^3`` volume represented by ``theta``."""
-        return np.real(centered_ifftn(self.embed(theta)))
+        return self.coefficient_volume(self.S @ np.asarray(theta))
+
+    def coefficient_volume(self, ac):
+        """Real-space ``L^3`` volume of the complex SphFB coefficients ``ac`` (``S @ theta``)."""
+        return np.real(centered_ifftn(self._embed_coefficients(ac)))

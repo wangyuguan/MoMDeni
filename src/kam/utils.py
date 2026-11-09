@@ -1,65 +1,17 @@
-"""Logging/plotting utilities and the CUDA moment kernels.
+"""Run-log capture, particle display, MRC volume I/O and the CUDA device helpers."""
 
-The gpu_* kernels accept and return NumPy arrays. Torch computes the
-moment matrix products, and the volume projections (SphFB matrices or
-voxel cuFINUFFT plans) use the same CUDA device.
-"""
-
-import atexit
 from contextlib import contextmanager
+import hashlib
 import os
 from pathlib import Path
 import select
+import subprocess
 import sys
 import threading
-from datetime import datetime
 
 import numpy as np
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt  # noqa: E402
-
-
-class _Tee:
-    """Write-through stream that also records into a file handle."""
-
-    def __init__(self, stream, fh):
-        self._stream = stream
-        self._fh = fh
-
-    def write(self, text):
-        self._stream.write(text)
-        keep = text.split("\r")[-1]
-        if keep:
-            self._fh.write(keep)
-        return len(text)
-
-    def flush(self):
-        self._stream.flush()
-        self._fh.flush()
-
-    def __getattr__(self, name):
-        return getattr(self._stream, name)
-
-
-def log_to(path, argv=None):
-    """Mirror stdout/stderr into an appended, timestamped log file."""
-    fh = open(path, "a", buffering=1)
-    fh.write("\n" + "=" * 70 + "\n")
-    fh.write(f"run {datetime.now():%Y-%m-%d %H:%M:%S}"
-             + (f"  |  {' '.join(argv)}" if argv else "") + "\n")
-    fh.write("=" * 70 + "\n")
-    sys.stdout = _Tee(sys.stdout, fh)
-    sys.stderr = _Tee(sys.stderr, fh)
-
-    def _close():
-        sys.stdout = getattr(sys.stdout, "_stream", sys.stdout)
-        sys.stderr = getattr(sys.stderr, "_stream", sys.stderr)
-        fh.close()
-
-    atexit.register(_close)
-    return path
+ROOT = Path(__file__).resolve().parents[2]
 
 
 class _WriteThroughStream:
@@ -73,12 +25,22 @@ class _WriteThroughStream:
         self._stream.flush()
         return result
 
-    def writelines(self, lines):
-        for line in lines:
-            self.write(line)
-
     def __getattr__(self, name):
         return getattr(self._stream, name)
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for block in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def git_commit(path):
+    """HEAD commit of the git checkout at ``path``; "unknown" outside a checkout (the value is stored in npz archives, which cannot hold None)."""
+    done = subprocess.run(["git", "-C", str(path), "rev-parse", "HEAD"], capture_output=True, text=True)
+    return done.stdout.strip() if done.returncode == 0 else "unknown"
 
 
 @contextmanager
@@ -106,8 +68,6 @@ def capture_run_log(path):
         remaining = memoryview(data)
         while remaining:
             written = os.write(fd, remaining)
-            if written <= 0:
-                raise OSError("log output write made no progress")
             remaining = remaining[written:]
 
     def drain(read_fd, terminal_fd):
@@ -213,9 +173,6 @@ def capture_run_log(path):
 def show_particle_image(axis, image):
     """Display a particle with per-image 1--99% grayscale limits."""
     image = np.asarray(image)
-    if (image.ndim != 2 or image.size == 0 or not np.isrealobj(image)
-            or not np.all(np.isfinite(image))):
-        raise ValueError("particle image must be a finite real 2-D array")
     lo, hi = np.percentile(image, (1, 99))
     if hi <= lo:
         lo, hi = float(image.min()), float(image.max())
@@ -226,126 +183,58 @@ def show_particle_image(axis, image):
                        interpolation="nearest", origin="upper")
 
 
-def plot_contrast_histogram(contrasts, path, bins=80):
-    """Save the positive per-image contrast histogram as a PDF."""
-    path = Path(path).with_suffix(".pdf")
-    contrasts = np.asarray(contrasts, dtype=float)
-    if (contrasts.ndim != 1 or contrasts.size == 0
-            or not np.all(np.isfinite(contrasts))
-            or np.any(contrasts <= 0)):
-        raise ValueError("contrasts must be a nonempty vector of positive values")
-    mean = float(np.mean(contrasts))
-    std = float(np.std(contrasts))
-    second = float(np.mean(contrasts**2))
-    third = float(np.mean(contrasts**3))
-    fig, ax = plt.subplots(figsize=(6.4, 4.2))
-    ax.hist(contrasts, bins=bins, density=True, color="#4c78a8",
-            alpha=0.85, edgecolor="white", linewidth=0.25)
-    ax.axvline(1.0, color="#e45756", ls="--", lw=1.5,
-               label="target mean = 1")
-    ax.set_xlabel("per-image contrast")
-    ax.set_ylabel("density")
-    ax.set_title("Simulated image contrast")
-    ax.text(0.98, 0.96,
-            f"mean={mean:.4f}\nstd={std:.4f}\nE[c²]={second:.4f}\nE[c³]={third:.4f}",
-            transform=ax.transAxes, ha="right", va="top", fontsize=9,
-            bbox=dict(boxstyle="round", facecolor="white", alpha=0.85,
-                      edgecolor="0.8"))
-    ax.legend(fontsize=9)
-    ax.grid(axis="y", alpha=0.2)
-    plt.tight_layout()
-    plt.savefig(path, dpi=140, bbox_inches="tight")
-    plt.close(fig)
+def load_volume(path):
+    """Read a 3-D MRC map and its isotropic voxel size in Angstrom."""
+    import mrcfile
+    with mrcfile.open(path, permissive=True) as m:
+        vol = np.array(m.data, dtype=np.float64)
+        axis_mapping = (
+            int(m.header.mapc), int(m.header.mapr), int(m.header.maps))
+        voxel_xyz = np.array([
+            float(m.voxel_size.x),
+            float(m.voxel_size.y),
+            float(m.voxel_size.z),
+        ])
+    # Convert MRC (section, row, column) storage to canonical (z, y, x) order.
+    stored_physical_axes = (axis_mapping[2], axis_mapping[1], axis_mapping[0])
+    permutation = tuple(stored_physical_axes.index(axis) for axis in (3, 2, 1))
+    if permutation != (0, 1, 2):
+        vol = np.ascontiguousarray(np.transpose(vol, permutation))
+    if not np.allclose(voxel_xyz, voxel_xyz[0], rtol=1e-5, atol=1e-7):
+        raise ValueError(
+            "alignment requires isotropic MRC voxels, but the header for "
+            f"{path} gives {voxel_xyz.tolist()} Angstrom")
+    return vol, float(np.mean(voxel_xyz))
 
 
-def plot_fsc(k, curve, path, voxel_size, L, title=None):
-    """Save an FSC curve as a PDF, marking the cutoff crossings.
-
-    ``k`` is the shell radius in cycles per box, so frequency is ``k / (L * voxel)``
-    in 1/Angstrom and the corresponding resolution is its reciprocal.
-    """
-    path = Path(path).with_suffix(".pdf")
-    from .postprocessing import fsc_resolution           # local: avoids an import cycle
-
-    freq = k / (L * voxel_size)                    # 1/Angstrom
-    fig, ax = plt.subplots(figsize=(6.4, 4.2))
-    ax.plot(freq, curve, lw=2, color="#1f77b4")
-    ax.axhline(0.0, color="0.7", lw=0.8)
-    res = fsc_resolution(k, curve, voxel_size, L)
-    ax.axhline(0.5, color="0.5", ls="--", lw=1)
-    if res:
-        ax.axvline(1.0 / res, color="0.5", ls="--", lw=1)
-    ax.annotate("FSC=0.5: " + (f"{res:.1f} $\\AA$" if res else "no measured crossing"),
-                (freq[-1], 0.5), ha="right", va="bottom", fontsize=9, color="0.3")
-    ax.set_xlim(0, freq[-1])
-    ax.set_ylim(min(-0.05, float(np.nanmin(curve)) - 0.05), 1.02)
-    ax.set_xlabel(r"spatial frequency (1/$\AA$)")
-    ax.set_ylabel("FSC")
-    ax.set_title(title or "FSC: reconstruction (aligned) vs. downsampled ground truth",
-                 fontsize=10)
-    ax.grid(alpha=0.25)
-    plt.tight_layout()
-    plt.savefig(path, dpi=120, bbox_inches="tight")
-    plt.close(fig)
+def save_mrc(vol, path, voxel_size):
+    """Write a real volume to an MRC file (float32, isotropic voxel size)."""
+    import mrcfile
+    with mrcfile.new(path, overwrite=True) as m:
+        m.set_data(np.ascontiguousarray(vol, dtype=np.float32))
+        m.voxel_size = voxel_size
 
 
-def plot_fsc_stages(k, curves, labels, path, voxel_size, L):
-    """Save overlaid FSC curves from successive fitting stages as a PDF."""
-    path = Path(path).with_suffix(".pdf")
-    from .postprocessing import fsc_resolution           # local: avoids an import cycle
-
-    freq = k / (L * voxel_size)
-    fig, ax = plt.subplots(figsize=(6.4, 4.2))
-    for curve, lab, col in zip(curves, labels,
-                               ("#1f77b4", "#ff7f0e", "#2ca02c", "#d62728")):
-        res = fsc_resolution(k, curve, voxel_size, L)
-        tag = f"{lab}: " + (f"{res:.1f} $\\AA$" if res else "no measured crossing")
-        ax.plot(freq, curve, lw=2, color=col, label=tag)
-    ax.axhline(0.5, color="0.5", ls="--", lw=1)
-    ax.axhline(0.0, color="0.7", lw=0.8)
-    ax.set_xlim(0, freq[-1])
-    ax.set_ylim(min(-0.05, float(min(np.nanmin(c) for c in curves)) - 0.05), 1.02)
-    ax.set_xlabel(r"spatial frequency (1/$\AA$)")
-    ax.set_ylabel("FSC")
-    ax.legend(fontsize=8, loc="upper right")
-    ax.grid(alpha=0.25)
-    plt.tight_layout()
-    plt.savefig(path, dpi=120, bbox_inches="tight")
-    plt.close(fig)
-
-
-def plot_projections(raw, ds, path, raw_res, ds_res):
-    """Save matched detector-grid and downsampled projections as a PDF."""
-    path = Path(path).with_suffix(".pdf")
-    n = raw.shape[0]
-    fig, ax = plt.subplots(2, n, figsize=(2.2 * n, 5.0), squeeze=False)
-    for j in range(n):
-        show_particle_image(ax[0, j], raw[j])
-        show_particle_image(ax[1, j], ds[j])
-    for a in ax.ravel():
-        a.axis("off")
-    fig.suptitle(
-        f"detector images ({raw_res}x{raw_res}, top) and moment input "
-        f"({ds_res}x{ds_res}, bottom)", fontsize=14)
-    plt.tight_layout()
-    plt.savefig(path, dpi=120, bbox_inches="tight")
-    plt.close(fig)
+def fourier_resample_real(volume, target_side):
+    """Resample a centered real cube by separable Fourier interpolation; also returns the relative imaginary part that was dropped."""
+    from scipy import signal
+    volume = np.asarray(volume, dtype=np.float64)
+    if volume.shape[0] == target_side:
+        return np.array(volume, copy=True), 0.0
+    result = np.fft.ifftshift(volume)
+    for axis in range(3):
+        result = signal.resample(result, target_side, axis=axis, window=None)
+    result = np.fft.fftshift(result)
+    imaginary_norm = float(np.linalg.norm(np.imag(result)))
+    result = np.asarray(np.real(result), dtype=np.float64)
+    return result, imaginary_norm / max(float(np.linalg.norm(result)), np.finfo(float).tiny)
 
 
 # ===========================================================================
-# CUDA backend shared by projection and alignment operators
+# CUDA device helpers
 # ===========================================================================
 
 _TORCH = None
-
-
-def gpu_available():
-    """True if PyTorch can use a CUDA device."""
-    try:
-        import torch
-        return bool(torch.cuda.is_available())
-    except Exception:
-        return False
 
 
 def _gpu_torch():
