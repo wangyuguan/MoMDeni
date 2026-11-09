@@ -1,8 +1,8 @@
 # MMDI
 
 Method-of-moments (MoM) ab initio modeling for cryo-EM from denoised particle images. The command-line tool `kam` denoises the particles,
-selects the least crowded ones, fits a low-resolution volume to their first three Fourier-Bessel moments (M1, M2, M3), and prepares a RELION
-refinement initialized from that volume.
+selects the least crowded ones, and fits a low-resolution volume to their first three Fourier-Bessel moments (M1, M2, M3); the volume is an ab initio
+model, for example to initialize a refinement.
 
 Installing in conda environment
 
@@ -16,7 +16,7 @@ pip install -e ".[gpu]"     # CUDA 12 GPUs (CuPy, cuFINUFFT); PyTorch must be a 
 ```
 
 The denoising step uses the submodules `fle_2d` and `fast-cryoEM-PCA` from the checkout, so clone with `--recursive` (or run
-`git submodule update --init`) and install in editable mode. RELION refinement needs RELION 5.
+`git submodule update --init`) and install in editable mode.
 
 Testing install
 
@@ -86,53 +86,6 @@ Other options:
   cryoSPARC (white particles) need the default `--flip-sign`.
 - `--strip-prefix` and `--native-pixel-size`: strip a leading folder from the image paths of the STAR file, or override its pixel size.
 - `--denoise-res`, `--moment-res`: sides of the denoised and the moment images (default 64 for both).
-
-### RELION refinement from the MoM map
-
-```bash
-kam relion_prepare --pipeline-dir results/10081_<job>/kam_pipeline
-bash results/10081_<job>/relion_prepare/run_refinement.sh
-```
-
-`kam relion_prepare` resamples the MoM map to the box and pixel size of the raw particles and writes `relion_prepare/` next to
-`kam_pipeline/`: the initial model, a particle STAR file without poses or origins, and `run_refinement.sh`, a RELION 5 3D auto-refine of all
-raw particles (initial low-pass 60 A, angular sampling 7.5 degrees with local searches from 1.8 degrees, translations up to 1/8 of the box
-in steps of 1/40 of the box). The mask diameter is computed from the first moment: 1.25 times the diameter that holds 99% of the
-positive mass of the mean particle image (the Hankel transform of M1). `--symmetry` defaults to the symmetry of the MoM map; `--particles` and `--datadir` refine another STAR file (for example the full-size particles when the pipeline read a downsampled
-copy). `relion_prepare` must run inside a Slurm job, normally the job of the pipeline: the refinement script copies that job's
-`#SBATCH` header (the refinement needs 2 GPUs and 24 CPUs) and loads RELION 5 through the environment modules of Princeton's Della
-cluster, so edit its `module` lines on other systems. Started outside a job, `run_refinement.sh` submits itself with `sbatch`.
-
-After the refinement,
-
-```bash
-kam postprocess --relion-dir results/10081_<job>/relion_refine --molecular-weight 2.99e5
-kam align_reference --relion-dir results/10081_<job>/relion_refine --reference-map emd_8511.map
-```
-
-`kam postprocess` makes a solvent mask from the refined map (its volume set by `--molecular-weight`, in Daltons) and runs
-`relion_postprocess` for the masked FSC resolution. `kam align_reference` aligns the MoM map and the refined map to a reference map and
-plots their FSC curves; the reference is used only for this comparison.
-
-A complete Slurm job for one dataset runs the commands above in order:
-
-```bash
-#!/usr/bin/env bash
-#SBATCH --nodes=1
-#SBATCH --ntasks=3
-#SBATCH --cpus-per-task=8
-#SBATCH --gres=gpu:2
-#SBATCH --mem=256G
-#SBATCH --time=12:00:00
-set -euo pipefail
-RESULTS=results
-RUN="$RESULTS/10081_${SLURM_JOB_ID}"
-kam pipeline particles.star --datadir stacks --outdir "$RESULTS" --dataset-label EMPIAR-10081 --symmetry C4 --device gpu --workers 16
-kam relion_prepare --pipeline-dir "$RUN/kam_pipeline"
-bash "$RUN/relion_prepare/run_refinement.sh"
-kam postprocess --relion-dir "$RUN/relion_refine" --molecular-weight 2.99e5   # with relion_postprocess on the PATH
-kam align_reference --relion-dir "$RUN/relion_refine" --reference-map emd_8511.map
-```
 
 # Acknowledgements
 
