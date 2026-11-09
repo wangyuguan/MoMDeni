@@ -27,7 +27,7 @@ the images `kam pipeline` selected and denoised, Fourier-cropped to 32 x 32 pixe
 kam reconstruct examples/EMPIAR-10081_denoised_32px.mrcs --outdir example_out --symmetry C4
 ```
 
-This takes about 3 minutes on one A100 GPU (`--device cpu` also works, more slowly). The map is `example_out/M3/recon.mrc` (32^3 voxels at
+This takes about 3 minutes on one A100 GPU (about 16 minutes on 16 CPU cores with `--device cpu`). The map is `example_out/M3/recon.mrc` (32^3 voxels at
 10.4 A).
 
 
