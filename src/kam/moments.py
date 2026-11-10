@@ -1,203 +1,36 @@
-"""Steerable Fourier--Bessel image moments for in-plane-uniform viewing.
+"""Steerable Fourier--Bessel (FB) moments of particle images under in-plane-uniform viewing, and the moment archive of a denoised stack.
 
-A Fourier image is expanded as ``sum_{q,t} c[q,t] Phi_q,t(kappa) e^{i q phi}``
-with ``kappa`` in cycles per moment-grid pixel (``0 <= kappa <= 1/2``), angular
-frequency ``|q| <= ell_max``, and a real radial basis ``Phi_q`` that is
-orthonormal for ``kappa dkappa``. ``Phi_q`` spans the top singular directions of
-the SphFB slice-radial functions ``j_ell(root kappa / 0.5) Y_ell^q(pi/2, 0)``
-(``ell = q mod 2``, ``|q| <= ell <= ell_max``), keeping the directions whose
-singular values exceed ``RADIAL_SINGULAR_THRESHOLD`` times the largest one of
-that ``q`` block. Images are real, so
-``c[-q] = (-1)**q conj(c[q])`` and only ``q >= 0`` is stored.
-
-An in-plane rotation by ``alpha`` multiplies ``c[q]`` by a phase in ``q alpha``.
-For an in-plane-uniform rotation distribution, every moment entry whose
-angular frequencies do not sum to zero vanishes. The retained blocks are
+An image is expanded as ``sum_{q,t} c[q,t] Phi_q,t(kappa) e^{i q phi}`` (``kappa`` in cycles per pixel, ``|q| <= L``), with radial functions
+``Phi_q`` that span the central slices of the SphFB volume basis (:class:`FBMomentBasis`). Only the entries invariant under in-plane rotation
+are kept:
 
     M1:  E c_0
     M2:  E c_q c_q^H                         q = 0..L
     M3:  E c_a (x) c_b (x) conj(c_{a+b})      0 <= a <= b, a + b <= L
 
-Each block is flattened and multiplied by the square root of the number of
-blocks of the complete ``|q| <= L`` tensor it represents (label permutations and
-``q -> -q`` conjugates). Euclidean norms and inner products of the flat
-vectors therefore equal Frobenius ones of the complete tensors.
-
-The model images are needed only at viewing directions (in-plane angle zero):
-averaging over the in-plane angle is exactly the block selection above.
+Each block is weighted so that norms of the flat vectors equal Frobenius norms of the full tensors. :func:`prepare_moments` forms the
+moments of the selected denoised images and saves them with the radial basis in ``moments.npz``, so that the fits use the same functions.
 """
 
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 import hashlib
-import os
-import sys
+import json
+from pathlib import Path
+import time
 
+import mrcfile
 import numpy as np
 from scipy.special import jv
-from tqdm import tqdm
 
 from . import utils
+from .utils import ROOT, git_commit, on_gpu, sha256_array, sha256_file, write_json
+from .volume import SphFBParam
 
-UPSAMPFAC = 2.0
-_DEVICE = "cpu"
+DEFAULT_MOMENT_RES = 64
 # Relative singular-value cut for the per-q radial basis of the slice span.
 RADIAL_SINGULAR_THRESHOLD = 1e-2
 
-def use_device(name):
-    """Select the device ('cpu' or 'gpu') for computational kernels; GPU execution requires PyTorch with CUDA support."""
-    global _DEVICE
-    _DEVICE = name
-    return _DEVICE
-
-
-def _on_gpu():
-    return _DEVICE == "gpu"
-
-
-def _progress(seq, total, desc, unit="chunk"):
-    """Add a stdout progress bar."""
-    return tqdm(seq, total=total, desc=desc, unit=unit, leave=False, file=sys.stdout)
-
-
-def centered_fftn(vol):
-    """Centered n-D forward FFT:  Vhat[k] = sum_n vol[n] exp(-2πi k·n / L)."""
-    return np.fft.fftshift(np.fft.fftn(np.fft.ifftshift(vol)))
-
-
-def centered_ifftn(fvol):
-    """Centered n-D inverse FFT (inverse of :func:`centered_fftn`)."""
-    return np.fft.fftshift(np.fft.ifftn(np.fft.ifftshift(fvol)))
-
-
-def centered_fft2(img):
-    """Centered two-dimensional forward FFT."""
-    return np.fft.fftshift(np.fft.fft2(np.fft.ifftshift(img, axes=(-2, -1)),
-                                       axes=(-2, -1)),
-                           axes=(-2, -1))
-
-
-def centered_ifft2(fimg):
-    """Centered 2-D inverse FFT (inverse of :func:`centered_fft2`)."""
-    return np.fft.fftshift(np.fft.ifft2(np.fft.ifftshift(fimg, axes=(-2, -1)),
-                                        axes=(-2, -1)),
-                           axes=(-2, -1))
-
-
-def fourier_crop(vol, res):
-    """Resample a real volume to ``res^3`` through its centered Fourier cube.
-
-    Cropping band-limits and downsamples; zero-padding upsamples. Both preserve
-    the physical field of view. The factor ``res^3 / L^3`` preserves density
-    amplitude, where ``L`` is the input side length.
-    """
-    L = vol.shape[0]
-    if res == L:
-        return vol
-    Vhat = centered_fftn(vol)
-    if res < L:
-        start = (L // 2) - (res // 2)
-        sl = slice(start, start + res)
-        Vhat = Vhat[sl, sl, sl]
-    else:
-        padded = np.zeros((res, res, res), dtype=Vhat.dtype)
-        start = (res // 2) - (L // 2)
-        sl = slice(start, start + L)
-        padded[sl, sl, sl] = Vhat
-        Vhat = padded
-    return np.real(centered_ifftn(Vhat)) * (res ** 3 / L ** 3)
-
-
-def centered_coords_1d(L):
-    """Integer frequency coordinate at each array index of a centered grid.
-
-    Array index ``a`` holds frequency ``a - L//2``. For even ``L`` this spans
-    ``-L/2, ..., L/2-1``; for odd ``L`` it spans
-    ``-(L-1)/2, ..., (L-1)/2``.
-    """
-    return np.arange(L) - (L // 2)
-
-
-class ViewingGrid:
-    """Viewing directions of an S^2 quadrature (the in-plane angle is integrated out by the FB moments).
-
-    Attributes
-    ----------
-    rots : (Ns, 3, 3)    one rotation per node, with the node direction as its third column
-    Ns : int             number of nodes
-    q : (Ns,)            probability masses for uniform surface measure
-    xyz : (Ns, 3)        node directions (unit vectors)
-    """
-
-    def __init__(self, rots, q, xyz):
-        self.rots = rots
-        self.Ns = len(q)
-        self.q = q
-        self.xyz = xyz
-
-
-SPHERE_RULE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                               "sphere_rules")
-_RULE_CACHE = {}
-
-
-def _sphere_rules():
-    """Load and cache the precomputed S^2 quadrature catalogue.
-
-    Files contain rows ``x y z w`` after two header lines. Nodes are normalized
-    to the unit sphere and weights to unit sum. Each rule records whether all
-    weights are positive. The returned catalogue is sorted by degree.
-    """
-    if _RULE_CACHE:
-        return _RULE_CACHE["rules"]
-    import re
-    rules = []
-    for path in sorted(os.listdir(SPHERE_RULE_DIR)):
-        m = re.match(r"N(\d+)_M(\d+)_(\w+)\.dat$", path)
-        if not m:
-            continue
-        d = np.genfromtxt(os.path.join(SPHERE_RULE_DIR, path), skip_header=2)
-        xyz, w = np.atleast_2d(d)[:, :3], np.atleast_1d(np.atleast_2d(d)[:, 3])
-        rules.append({"degree": int(m.group(1)), "n": w.size,
-                      "symmetry": m.group(3), "file": path,
-                      "xyz": xyz / np.linalg.norm(xyz, axis=1, keepdims=True),
-                      "q": w / w.sum(), "positive": bool(np.all(w > 0))})
-    rules.sort(key=lambda r: r["degree"])
-    _RULE_CACHE["rules"] = rules
-    return rules
-
-
-def sphere_quadrature(degree):
-    """Select the smallest positive-weight Gauss quadrature on S^2 of at least this polynomial degree.
-
-    Rules with negative weights are excluded because the weights define a
-    probability mass over viewing directions.
-
-    Returns polar angles, azimuths, normalized weights, and unit directions.
-    """
-    usable = [r for r in _sphere_rules() if r["positive"] and r["degree"] >= degree]
-    rule = min(usable, key=lambda r: r["n"])
-    xyz = rule["xyz"]
-    theta = np.arccos(np.clip(xyz[:, 2], -1.0, 1.0))
-    phi = np.arctan2(xyz[:, 1], xyz[:, 0])
-    return theta, phi, rule["q"].copy(), xyz.copy()
-
-
-def viewing_grid(degree):
-    """The viewing directions of :func:`sphere_quadrature` as rotations with the node direction as third column."""
-    th, ph, q, xyz = sphere_quadrature(degree)
-    rots = np.empty((th.size, 3, 3))
-    for a in range(th.size):
-        rots[a] = Rz(ph[a]) @ Ry(th[a])
-    return ViewingGrid(rots, q, xyz)
-
-
-def Rz(a):
-    c, s = np.cos(a), np.sin(a)
-    return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
-
-
-def Ry(a):
-    c, s = np.cos(a), np.sin(a)
-    return np.array([[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]])
 
 def _radial_quadrature(side):
     """Gauss--Legendre nodes and ``dkappa`` weights on ``[0, 1/2]``."""
@@ -221,16 +54,10 @@ class FBMomentBasis:
     """
 
     def __init__(self, side, ell_max, radial=None):
-        from .optimization import SphFBParam
-
         self.side = int(side)
         self.ell_max = int(ell_max)
         if radial is None:
             param = SphFBParam(self.side, self.ell_max, np.eye(3)[None])
-            if param.ell_max != self.ell_max:
-                raise ValueError(
-                    f"ell_max={self.ell_max} is unsupported at side "
-                    f"{self.side}; at most {param.ell_max}")
             self.nodes, self.weights = _radial_quadrature(self.side)
             sw = np.sqrt(self.nodes * self.weights)
             ray = self._ray(param)
@@ -284,7 +111,7 @@ class FBMomentBasis:
         """Matrix ``G`` with model coefficients ``c = u @ G.T``.
 
         ``u`` holds the complex SphFB coefficients of a rotated volume, as in
-        :meth:`optimization.SphFBParam._rotated_coefficients`.
+        :meth:`volume.SphFBParam._rotated_coefficients`.
         """
         sw = np.sqrt(self.nodes * self.weights)
         ray = self._ray(param)
@@ -300,7 +127,7 @@ class FBMomentBasis:
         Images are flattened in C order over ``(row, column)`` and use the
         centered-FFT pixel origin ``(image_side//2, image_side//2)``. The
         image transform matches the central ``side x side`` crop of
-        :func:`moments.centered_fft2`: model coordinate ``x`` is the column
+        :func:`utils.centered_fft2`: model coordinate ``x`` is the column
         frequency and ``y`` the row frequency. The angular Fourier integral of
         the image DTFT is evaluated exactly with Bessel functions.
         """
@@ -398,7 +225,7 @@ class FBMomentBasis:
         Orders not listed are returned as ``None``.
         """
         C, w = self._check(C, w)
-        if _on_gpu():
+        if on_gpu():
             return self._moments_gpu(C, w, orders, batch_size)
         m = [np.zeros(s, dtype=np.complex128) if k + 1 in orders else None
              for k, s in enumerate(self.shapes)]
@@ -430,7 +257,7 @@ class FBMomentBasis:
         ``df = Re vdot(G_C, dC) + G_w @ dw``.
         """
         C, w = self._check(C, w)
-        if _on_gpu():
+        if on_gpu():
             return self._moment_gradients_gpu(C, w, clean)
         X = [C[:, s] for s in self.slices]
         G = [np.zeros_like(x) for x in X]
@@ -526,47 +353,6 @@ class FBMomentBasis:
         return torch.cat(G, dim=1).cpu().numpy(), gw.cpu().numpy()
 
 
-def fb_objective_and_grad(theta, p, param, mbar1, mbar2, mbar3, lambdas, return_info=False):
-    """Fourier--Bessel M1--M3 loss and its gradients with respect to the volume coefficients and the viewing masses.
-
-    ``param`` must carry an ``fb_basis``; targets are the flat FB moments, the real parts of the
-    empirical moments (equal to augmenting every image with its mirror). The model is symmetrized the
-    same way: projections at antipodal viewing directions of a real volume are mirror images, so taking
-    the real part of the predictions equals antipodally symmetrizing the viewing density, and the
-    residuals compare real parts on both sides.
-    """
-    basis = param.fb_basis
-    targets = (mbar1, mbar2, mbar3)
-    weights = [np.asarray(weight, dtype=float) for weight in lambdas]
-    p = np.asarray(p, dtype=float)
-    active = [bool(np.any(wt > 0)) for wt in weights]
-    C = np.asarray(param.forward_images(theta))
-    predictions = basis.moments(
-        C, p, orders=tuple(k + 1 for k in range(3) if active[k]))
-    masked, residuals, clean = [None] * 3, [None] * 3, [None] * 3
-    costs, misfits = np.zeros(3), np.full(3, np.nan)
-    for k in range(3):
-        if not active[k]:
-            continue
-        # The residual is real, so the conjugate-linear gradient contraction below yields exactly d sum w (Re pred - t)^2.
-        masked[k] = predictions[k].real.astype(np.complex128)
-        residuals[k] = masked[k] - np.asarray(targets[k])
-        misfits[k] = np.linalg.norm(residuals[k])
-        costs[k] = float(np.sum(weights[k] * np.abs(residuals[k]) ** 2))
-        clean[k] = weights[k] * residuals[k]
-    G, grad_p = basis.moment_gradients(C, p, clean)
-    grad_theta = param.adjoint_images(G)
-    f = float(costs.sum())
-    if not return_info:
-        return f, grad_theta, grad_p
-    info = {"f": f}
-    for k in range(3):
-        info.update({f"f{k+1}": float(costs[k]), f"m{k+1}": predictions[k],
-                     f"masked_m{k+1}": masked[k],
-                     f"misfit{k+1}": float(misfits[k])})
-    return f, grad_theta, grad_p, info
-
-
 def empirical_moments(images, moment_res, ell_max, batch_size=256):
     """Uniformly weighted FB M1--M3 of a real denoised image stack; returns ``(basis, (m1, m2, m3))``."""
     images = np.asarray(images)
@@ -581,3 +367,198 @@ def empirical_moments(images, moment_res, ell_max, batch_size=256):
         for total, part in zip(sums, basis.moments(C, w[start:start + len(batch)])):
             total += part
     return basis, tuple(sums)
+
+
+# ===========================================================================
+# Moment archive (prepared/moments.npz and report.json)
+# ===========================================================================
+
+@dataclass(frozen=True)
+class MomentPreparationConfig:
+    """Configuration for :func:`prepare_moments`."""
+
+    denoising_dir: Path
+    selection_file: Path
+    output_dir: Path
+    n_images: int
+    denoise_res: int
+    moment_res: int
+    batch_size: int
+    device: str
+    fb_ell_max: int
+
+
+@dataclass(frozen=True)
+class PreparedMomentData:
+    """Arrays and geometry loaded from ``moments.npz``."""
+
+    directory: Path
+    report: dict
+    values: dict
+    target: np.ndarray
+    order: int
+    side: int
+    pixel_size: float
+    n_images: int
+    fb_basis: FBMomentBasis
+    shapes: tuple
+
+
+def _scalar(saved, key):
+    return np.asarray(saved[key]).reshape(()).item()
+
+
+def read_denoising_output(directory):
+    """The files of a denoising output and the manifest entries the moment archive records."""
+
+    directory = Path(directory).resolve(strict=True)
+    manifest_path = directory / "manifest.npz"
+    with np.load(manifest_path, allow_pickle=False) as saved:
+        manifest = {key: _scalar(saved, key) for key in ("star_path", "data_folder", "stack_prefix", "source_fingerprint")}
+        manifest.update(
+            dataset=str(_scalar(saved, "dataset")),
+            native_res=int(_scalar(saved, "native_res")),
+            native_pixel=float(_scalar(saved, "vox_native")),
+            denoise_res=int(_scalar(saved, "denoise_res")),
+            denoise_pixel=float(_scalar(saved, "vox_denoise")),
+            contrast_est=np.asarray(saved["contrast_est"], dtype=np.float64),
+        )
+        stack_path = Path(str(_scalar(saved, "denoised_stack")))
+    return directory, stack_path, manifest_path, directory / "report.json", manifest
+
+
+def load_selection(selection_file):
+    """The selected positions, source rows and image names of a selection file."""
+
+    selection_file = Path(selection_file).resolve(strict=True)
+    with np.load(selection_file, allow_pickle=False) as saved:
+        positions = np.asarray(saved["selected_positions"], dtype=np.int64)
+        rows = np.asarray(saved["selected_source_rows"], dtype=np.int64)
+        names = np.asarray(saved["selected_image_names"])
+    return selection_file, positions, rows, names
+
+
+def _save_moments(path, images, moment_res, ell_max, batch_size, **fields):
+    """Form the in-plane-invariant FB M1--M3 of ``images`` and save them with ``fields`` and the radial basis to ``path``.
+
+    Mirroring an image conjugates its stored q>=0 FB coefficients, so averaging every image with its mirror leaves exactly the real parts of
+    the invariant moments; only the real parts are kept, and no images are duplicated. Returns the basis, the moments and their metadata."""
+
+    basis, moments = empirical_moments(images, moment_res, ell_max, batch_size=batch_size)
+    m1, m2, m3 = (np.ascontiguousarray(moment.real).astype(np.complex128) for moment in moments)
+    nodes, weights, radial, counts = basis.radial_arrays()
+    np.savez(path, mbar1=m1, mbar2=m2, mbar3=m3, ds_res=moment_res, fb_ell_max=basis.ell_max, fb_radial_nodes=nodes,
+             fb_radial_weights=weights, fb_radial_basis=radial, fb_radial_counts=counts, **fields)
+    metadata = dict(n_images=len(images), denoise_res=int(np.shape(images)[1]), moment_res=moment_res, fb=basis.summary(),
+                    batch_size=batch_size)
+    return basis, (m1, m2, m3), metadata
+
+
+def prepare_moments_from_images(images, pixel_size, output, *, moment_res, ell_max, batch_size=256, dataset="", source=""):
+    """Write ``moments.npz`` and ``report.json`` (the files of :func:`prepare_moments`) for a stack of denoised images of pixel ``pixel_size``."""
+
+    output = Path(output).resolve()
+    output.mkdir(parents=True, exist_ok=False)
+    started = time.monotonic()
+    side = int(np.shape(images)[-1])
+    pixel = pixel_size * side / moment_res
+    moments_path = output / "moments.npz"
+    basis, (m1, m2, m3), metadata = _save_moments(
+        moments_path, images, moment_res, ell_max, batch_size, n_images=len(images), dataset=dataset, pixel_size=pixel,
+        native_side=side, native_pixel_size=pixel_size)
+    write_json(output / "report.json", dict(
+        created_utc=datetime.now(timezone.utc).isoformat(), dataset=dataset, denoised_stack=str(source),
+        n_images=len(images), image_side=side, image_pixel_size_angstrom=pixel_size, moment_res=moment_res,
+        pixel_size_angstrom=pixel, fb_ell_max=ell_max, n_frequencies=basis.n_coefficients,
+        n_m2_entries=int(m2.size), n_canonical_m3_entries=len(m3), metadata=metadata,
+        prepared_file=str(moments_path), prepared_sha256=sha256_file(moments_path), kam_cryoem_commit=git_commit(ROOT),
+        elapsed_seconds=time.monotonic() - started))
+    return output
+
+
+def prepare_moments(config: MomentPreparationConfig):
+    """Prepare M1--M3 from the selected images of a denoising output."""
+
+    output = config.output_dir.resolve()
+    if output.exists() and any(output.iterdir()):
+        raise FileExistsError("use a new or empty moment preparation directory")
+    output.mkdir(parents=True, exist_ok=True)
+    started = time.monotonic()
+    timings = {}
+
+    utils.use_device(config.device)
+    denoising_dir, stack_path, manifest_path, denoising_report, manifest = read_denoising_output(config.denoising_dir)
+    selection_path, positions, rows, names = load_selection(config.selection_file)
+    timings["input_loading"] = time.monotonic() - started
+
+    phase_started = time.monotonic()
+    with mrcfile.mmap(stack_path, mode="r", permissive=False) as handle:
+        selected = np.asarray(handle.data[positions], dtype=np.float32)
+    timings["selected_image_loading"] = time.monotonic() - phase_started
+
+    phase_started = time.monotonic()
+    pixel = manifest["native_res"] * manifest["native_pixel"] / config.moment_res
+    moments_path = output / "moments.npz"
+    basis, moments, metadata = _save_moments(
+        moments_path, selected, config.moment_res, config.fb_ell_max, config.batch_size,
+        selected_positions=positions, selected_source_rows=rows, selected_image_names=names, n_images=len(positions),
+        dataset=manifest["dataset"], pixel_size=pixel, native_side=manifest["native_res"], native_pixel_size=manifest["native_pixel"],
+        denoise_side=manifest["denoise_res"], denoised_pixel_size=manifest["denoise_pixel"])
+    del selected
+    timings["moment_formation"] = time.monotonic() - phase_started
+    metadata.update(moment_norms=[float(np.linalg.norm(moment)) for moment in moments])
+    report = dict(
+        created_utc=datetime.now(timezone.utc).isoformat(),
+        fb_ell_max=config.fb_ell_max,
+        dataset=manifest["dataset"],
+        denoising_directory=str(denoising_dir),
+        denoised_stack=str(stack_path),
+        denoising_manifest=str(manifest_path),
+        denoising_manifest_sha256=sha256_file(manifest_path),
+        denoising_report=str(denoising_report),
+        selection_file=str(selection_path),
+        selection_sha256=sha256_file(selection_path),
+        n_images=len(positions),
+        n_requested=config.n_images,
+        denoise_res=config.denoise_res,
+        moment_res=config.moment_res,
+        pixel_size_angstrom=pixel,
+        native_side=manifest["native_res"],
+        native_pixel_size_angstrom=manifest["native_pixel"],
+        n_frequencies=basis.n_coefficients,
+        n_m2_entries=int(moments[1].size),
+        n_canonical_m3_entries=len(moments[2]),
+        source=dict(
+            star_path=str(manifest["star_path"]),
+            data_folder=str(manifest["data_folder"]),
+            stack_prefix=str(manifest["stack_prefix"]),
+            source_fingerprint=str(manifest["source_fingerprint"]),
+            contrast_estimate_sha256=sha256_array(manifest["contrast_est"]),
+            contrast_estimate_range=[float(manifest["contrast_est"].min()), float(manifest["contrast_est"].max())],
+        ),
+        metadata=metadata,
+        config={**asdict(config), "denoising_dir": str(config.denoising_dir), "selection_file": str(config.selection_file),
+                "output_dir": str(config.output_dir)},
+        prepared_file=str(moments_path),
+        prepared_sha256=sha256_file(moments_path),
+        kam_cryoem_commit=git_commit(ROOT),
+    )
+    timings["total"] = time.monotonic() - started
+    report.update(timings_seconds=timings, elapsed_seconds=timings["total"])
+    write_json(output / "report.json", report)
+
+
+def load_prepared_moments(path, order):
+    """Load the moment of order ``order`` (the fit target) and the geometry of a moment archive."""
+
+    path = Path(path).resolve(strict=True)
+    report = json.loads((path / "report.json").read_text())
+    with np.load(path / "moments.npz", allow_pickle=False) as saved:
+        values = {key: np.asarray(saved[key]).copy() for key in saved.files}
+    side = int(values["ds_res"].reshape(()))
+    fb_basis = FBMomentBasis(side, int(values["fb_ell_max"].reshape(())), radial=tuple(
+        values[key] for key in ("fb_radial_nodes", "fb_radial_weights", "fb_radial_basis", "fb_radial_counts")))
+    return PreparedMomentData(
+        directory=path, report=report, values=values, target=np.asarray(values[f"mbar{order}"], dtype=np.complex128), order=order,
+        side=side, pixel_size=float(values["pixel_size"].reshape(())), n_images=int(values["n_images"].reshape(())),
+        fb_basis=fb_basis, shapes=fb_basis.shapes)

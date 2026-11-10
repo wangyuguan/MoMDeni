@@ -1,16 +1,12 @@
 #!/usr/bin/env python3
-"""Denoised-particle Fourier--Bessel moment reconstruction.
+"""The ``kam`` command.
 
-    kam pipeline particles.star --outdir results ...
-                              denoise, select, reconstruct M1, M2 and M3
-    kam reconstruct denoised.mrcs --outdir out ...
-                              M1, M2 and M3 of a stack of denoised images
+    kam pipeline particles.star --outdir results ...    denoise, select and reconstruct from a RELION particle STAR file
+    kam reconstruct denoised.mrcs --outdir out ...      reconstruct from a stack of denoised images
 
-Each pipeline run writes to
-``<results>/<EMPIAR-number>_<SLURM-job-id>/kam_pipeline``. Local runs use a
-collision-resistant ``local`` identifier.
-The pipeline saves resolved settings to hyperparameters.json and appends live
-progress, subprocess output, and errors to run.log.
+A pipeline run writes to ``<results>/<EMPIAR number>_<Slurm job id>/kam_pipeline`` (a local identifier outside Slurm), with its settings in
+``hyperparameters.json`` and its log in ``run.log``; a resumed run reuses the stages that finished with the same settings. ``kam denoise``
+and ``kam select`` are the stages the pipeline runs as separate processes.
 """
 
 from __future__ import annotations
@@ -19,7 +15,6 @@ import argparse
 from dataclasses import asdict
 from datetime import datetime, timezone
 import json
-import math
 import os
 from pathlib import Path
 import re
@@ -27,33 +22,23 @@ import shlex
 import shutil
 import subprocess
 import sys
-import tempfile
-import threading
 import time
-import traceback
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt  # noqa: E402
-from matplotlib.patches import Rectangle
 import mrcfile
 import numpy as np
 
-from .denoise import DEFAULT_DENOISE_MAX_ORDER, FastCWFDenoiseConfig, denoise_relion_particles
-from . import postprocessing
-from .postprocessing import (DEFAULT_DENOISE_RES, DEFAULT_ELL_MAX, DEFAULT_MOMENT_RES, M3_MAXITER, MAXITER,
-                             N_INIT, DEFAULT_N_SELECT, DEFAULT_SHIFT_STEP_PX, DEFAULT_VIEWING_DEGREE, ReconstructionConfig,
-                             reconstruct_single_moment)
-from .preprocessing import (RelionParticles, nearest_particle_distances,
-                           select_low_crowding_particles)
-from .utils import ROOT, capture_run_log, git_commit, sha256_file, show_particle_image
+from .particles import (DEFAULT_DENOISE_MAX_ORDER, DEFAULT_DENOISE_RES, DEFAULT_N_SELECT, DEFAULT_NEIGHBOR_FRACTION,
+                        SELECTION_OUTPUT_NAMES, FastCWFDenoiseConfig, denoise_relion_particles, select_particles)
+from .moments import DEFAULT_MOMENT_RES, MomentPreparationConfig, prepare_moments, prepare_moments_from_images
+from .optimization import (DEFAULT_ELL_MAX, DEFAULT_VIEWING_DEGREE, M3_MAXITER, MAXITER, N_INIT, ReconstructionConfig,
+                           reconstruct_order, select_m2_start)
+from .shift import DEFAULT_SHIFT_STEP_PX
+from .utils import ROOT, capture_run_log, git_commit, use_device
 
 # ===========================================================================
 # MoM pipeline orchestration
 # ===========================================================================
 
-DEFAULT_NEIGHBOR_FRACTION = 280.0 / 380.0
-PIPELINE_HEARTBEAT_SECONDS = 60.0
 LOCAL_RUN_ID = (
     "local_" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     + f"_{os.getpid()}"
@@ -72,22 +57,10 @@ def _write_json_exclusive(path: Path, value: dict) -> None:
 
 
 def _write_json_atomic(path: Path, value: dict) -> None:
-    """Atomically create or replace a JSON report in ``path.parent``."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = None
-    try:
-        with tempfile.NamedTemporaryFile(
-                mode="w", dir=path.parent, prefix=f".{path.name}.",
-                suffix=".tmp", delete=False) as stream:
-            temporary = Path(stream.name)
-            json.dump(value, stream, indent=2, allow_nan=False)
-            stream.write("\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-    finally:
-        if temporary is not None and temporary.exists():
-            temporary.unlink()
+    """Create or replace a JSON report in one step (written next to it, then renamed), so an interrupted run never leaves half a report."""
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(json.dumps(value, indent=2, allow_nan=False) + "\n")
+    os.replace(temporary, path)
 
 
 def _optional_path(value: Path | None) -> str | None:
@@ -95,11 +68,7 @@ def _optional_path(value: Path | None) -> str | None:
 
 
 def _dataset_label(args: argparse.Namespace) -> str:
-    if args.dataset_label is not None:
-        label = args.dataset_label.strip()
-    else:
-        label = args.star_path.stem
-    return label
+    return args.star_path.stem if args.dataset_label is None else args.dataset_label
 
 
 def _dataset_number(args: argparse.Namespace) -> str:
@@ -111,11 +80,7 @@ def _dataset_number(args: argparse.Namespace) -> str:
 
 def _execution_id() -> str:
     """Return the Slurm job ID, or a collision-resistant local-run ID."""
-    job_id = os.environ.get("SLURM_JOB_ID")
-    if job_id is None:
-        return LOCAL_RUN_ID
-    job_id = job_id.strip()
-    return job_id
+    return os.environ.get("SLURM_JOB_ID", LOCAL_RUN_ID)
 
 
 def _configuration(args: argparse.Namespace) -> dict:
@@ -132,7 +97,6 @@ def _configuration(args: argparse.Namespace) -> dict:
             "native_pixel_size": args.native_pixel_size,
         },
         "denoising": {
-            "seed": args.seed,
             "resolution": args.denoise_res,
             "fle_max_order": args.denoise_max_order,
             "batch_size": args.batch_size,
@@ -169,7 +133,6 @@ def _denoise_command(args, paths):
         sys.executable, "-u", "-m", "kam.command_line", "denoise",
         str(args.star_path.expanduser().resolve()),
         "--dataset-label", _dataset_label(args),
-        "--seed", str(args.seed),
         "--denoise-res", str(args.denoise_res),
         "--batch-size", str(args.batch_size), "--workers", str(args.workers),
         "--device", args.device,
@@ -203,20 +166,14 @@ def _selection_command(args, paths, auto=True):
 
 
 def _report_value(value):
-    """Normalize resolved settings without reading particle data."""
+    """The resolved settings as JSON values (paths as absolute strings)."""
     if isinstance(value, Path):
         return str(value.expanduser().resolve())
     if isinstance(value, dict):
         return {str(key): _report_value(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
         return [_report_value(item) for item in value]
-    if isinstance(value, np.generic):
-        return _report_value(value.item())
-    if value is None or isinstance(value, (str, bool, int)):
-        return value
-    if isinstance(value, float) and math.isfinite(value):
-        return value
-    raise TypeError(f"unsupported hyperparameter report value: {value!r}")
+    return value
 
 
 def _resolved_stage_settings(args, paths, auto=True):
@@ -234,7 +191,7 @@ def _hyperparameters(args: argparse.Namespace, paths: dict[str, Path]) -> dict:
     stages = {"denoise": denoise, "selection": selection}
     stages["redenoise"], stages["reselect"] = _resolved_stage_settings(*_second_pass(args, paths), auto=False)
     final = paths["redenoised"]
-    stages["moment_preparation"] = asdict(postprocessing.MomentPreparationConfig(
+    stages["moment_preparation"] = asdict(MomentPreparationConfig(
         denoising_dir=final,
         selection_file=final / "selection.npz",
         output_dir=paths["prepared"],
@@ -316,19 +273,7 @@ def _ensure_manifest(args: argparse.Namespace, paths: dict[str, Path]) -> None:
     paths["root"].mkdir(parents=True, exist_ok=True)
     if manifest_path.exists():
         return
-    # Slurm creates stdout/stderr before the payload starts.  Keeping those
-    # logs in the MoM directory must not make a fresh pipeline look like an
-    # unrelated, partially populated run.
-    def scheduler_log(path: Path) -> bool:
-        return (path.is_file() and (path.name == "run.log" or
-                (path.name.startswith("slurm_")
-                 and path.suffix in {".out", ".err"})))
-
-    unrelated = [
-        path for path in paths["root"].iterdir()
-        if path != manifest_path and not scheduler_log(path)
-    ]
-    if unrelated:
+    if any(path != paths["log"] for path in paths["root"].iterdir()):      # run.log is opened before the manifest is written
         raise FileExistsError(
             f"output directory is nonempty but has no pipeline manifest: "
             f"{paths['root']}")
@@ -473,7 +418,7 @@ def _prepare(args: argparse.Namespace, paths: dict[str, Path], configuration: di
                   paths["denoising"], paths["selection"] / "selection.npz", paths["prepared"], args.n_select,
                   args.denoise_res, args.moment_res, args.ell_max), flush=True)
         if not args.dry_run:
-            postprocessing.prepare_moments(postprocessing.MomentPreparationConfig(
+            prepare_moments(MomentPreparationConfig(
                 denoising_dir=paths["denoising"],
                 selection_file=paths["selection"] / "selection.npz",
                 output_dir=paths["prepared"],
@@ -492,23 +437,6 @@ def _shift_settings(args: argparse.Namespace, side: int) -> dict:
                 max_px=side / 8 if args.shift_max_px is None else args.shift_max_px)
 
 
-def _reconstruct_order(config: ReconstructionConfig, shift: dict):
-    """Fit one moment order; the ring shift distribution of ``shift`` is fitted jointly and saved in ``shift_distribution.json``.
-
-    Initialization i starts from the shift law of initialization i of ``config.initial_fit``. The laws of the initializations that
-    finished before an interruption are kept (the finished initializations are a prefix) and the next fit is numbered after them."""
-    from . import shift_distribution
-
-    path = config.output_dir / "shift_distribution.json"
-    done = sum((config.output_dir / f"init_{i}" / "summary.json").is_file() for i in range(config.n_init))
-    warm = [] if config.initial_fit is None else shift_distribution.read_records(
-        config.initial_fit / "shift_distribution.json")
-    with shift_distribution.shift_law(
-            shift["step_px"], shift["max_px"], warm=[record["d"] for record in warm],
-            finished=shift_distribution.read_records(path)[:done], path=path):
-        return reconstruct_single_moment(config)
-
-
 def _maxiter(order: int) -> int:
     """L-BFGS iteration limit of moment order ``order``: M3_MAXITER for M3, MAXITER for M1 and M2."""
     return M3_MAXITER if order == 3 else MAXITER
@@ -525,14 +453,14 @@ def _reconstruct(args: argparse.Namespace, paths: dict[str, Path], configuration
     n_init = 1 if order == 3 else N_INIT
 
     def execute():
-        print("[pipeline] reconstruct_single_moment(prepared={!s}, output={!s}, order={}, L={}, viewing_degree={}, "
+        print("[pipeline] reconstruct_order(prepared={!s}, output={!s}, order={}, L={}, viewing_degree={}, "
               "n_init={}, maxiter={}, initial_fit={!s})".format(
                   paths["prepared"], output, order, args.ell_max, args.viewing_degree,
                   n_init, _maxiter(order), initial_fit), flush=True)
         print(f"[pipeline] shift distribution: rings every {args.shift_step_px} px up to "
               f"{'side/8' if args.shift_max_px is None else args.shift_max_px} px (M1, M2, M3)", flush=True)
         if not args.dry_run:
-            _reconstruct_order(ReconstructionConfig(
+            reconstruct_order(ReconstructionConfig(
                 prepared_dir=paths["prepared"], output_dir=output, order=order,
                 ell_max=args.ell_max, viewing_degree=args.viewing_degree, symmetry=args.symmetry,
                 n_init=n_init, maxiter=_maxiter(order), device=args.device,
@@ -544,14 +472,13 @@ def _reconstruct(args: argparse.Namespace, paths: dict[str, Path], configuration
 
 
 def _select_m2(args: argparse.Namespace, paths: dict[str, Path], configuration: dict) -> str:
-    """Pick the M2 initialization whose solution best explains M3 (``shift_distribution.select_m2_start``)."""
-    from . import shift_distribution
+    """Pick the M2 initialization whose solution best explains M3 (``optimization.select_m2_start``)."""
 
     def execute():
         print(f"[pipeline] select_m2_start(prepared={paths['prepared']!s}, m2={paths['m2']!s}, output={paths['m2_selected']!s})", flush=True)
         if not args.dry_run:
-            shift_distribution.select_m2_start(paths["prepared"], paths["m2"], paths["m2_selected"], ell_max=args.ell_max,
-                                               viewing_degree=args.viewing_degree, symmetry=args.symmetry, device=args.device)
+            select_m2_start(paths["prepared"], paths["m2"], paths["m2_selected"], ell_max=args.ell_max,
+                            viewing_degree=args.viewing_degree, symmetry=args.symmetry, device=args.device)
 
     return _run_stage("M2 selection", _stage_report_path(paths, "m2_select"), configuration, args, execute,
                       existing=_nonempty(paths["m2_selected"]))
@@ -679,12 +606,12 @@ def _pipeline_parser() -> argparse.ArgumentParser:
         help="degree of the positive spherical-harmonic viewing density")
     parser.add_argument(
         "--symmetry", default="C1",
-        help="point group of the molecule (C1, Cn, Dn, T, O or I; axes as in kam.symmetry): the volume coefficients are restricted to it")
+        help="point group of the molecule (C1, Cn, Dn, T, O or I; axes as in kam.volume): the volume coefficients are restricted to it")
     parser.add_argument(
         "--shift-step-px", type=float, default=DEFAULT_SHIFT_STEP_PX,
         help=("spacing of the rings of the shift distribution in moment-grid pixels (sub-pixel allowed); the per-image shifts "
               "are modeled by an isotropic radial distribution on these rings, "
-              "fitted jointly with the volume and the viewing density in each of the M1, M2 and M3 stages (see kam.shift_distribution)"))
+              "fitted jointly with the volume and the viewing density in each of the M1, M2 and M3 stages (see kam.shift)"))
     parser.add_argument(
         "--shift-max-px", type=float, default=None,
         help=("largest ring radius in moment-grid pixels (default: a quarter of the radius of the "
@@ -737,21 +664,13 @@ def pipeline_main(argv=None) -> None:
               flush=True)
         print(f"[pipeline] run_root={paths['run_root']}", flush=True)
         print(f"[pipeline] output={paths['root']} resume={args.resume}", flush=True)
-        try:
-            _ensure_manifest(args, paths)
-            parameters = _hyperparameters(args, paths)
-            if not paths["hyperparameters"].exists():
-                _write_json_exclusive(
-                    paths["hyperparameters"], {**parameters, "started_utc": invocation_started_utc})
-            print(f"[pipeline] hyperparameters={paths['hyperparameters']}", flush=True)
-            print(json.dumps(parameters["arguments"], indent=2), flush=True)
-            _execute_pipeline(args, paths, invocation_started_utc, invocation_started)
-        except BaseException:
-            print(f"[{datetime.now(timezone.utc).isoformat()}] PIPELINE FAILED "
-                  f"elapsed={time.monotonic() - invocation_started:.1f}s",
-                  file=sys.stderr, flush=True)
-            traceback.print_exc()
-            raise
+        _ensure_manifest(args, paths)
+        parameters = _hyperparameters(args, paths)
+        if not paths["hyperparameters"].exists():
+            _write_json_exclusive(paths["hyperparameters"], {**parameters, "started_utc": invocation_started_utc})
+        print(f"[pipeline] hyperparameters={paths['hyperparameters']}", flush=True)
+        print(json.dumps(parameters["arguments"], indent=2), flush=True)
+        _execute_pipeline(args, paths, invocation_started_utc, invocation_started)
         print(f"[{datetime.now(timezone.utc).isoformat()}] PIPELINE COMPLETE "
               f"elapsed={time.monotonic() - invocation_started:.1f}s",
               flush=True)
@@ -763,35 +682,11 @@ def _execute_pipeline(args, paths, invocation_started_utc, invocation_started):
     observed = {}
 
     def run_stage(label, function) -> None:
-        stage_started_utc = datetime.now(timezone.utc).isoformat()
         stage_started = time.monotonic()
-        print(f"[{stage_started_utc}] STEP {len(statuses) + 1}/{len(stages)} START {label}",
-              flush=True)
-        stop_heartbeat = threading.Event()
-
-        def heartbeat():
-            while not stop_heartbeat.wait(PIPELINE_HEARTBEAT_SECONDS):
-                print(f"[{datetime.now(timezone.utc).isoformat()}] "
-                      f"{label} RUNNING elapsed={time.monotonic() - stage_started:.1f}s",
-                      flush=True)
-
-        monitor = None
-        if not args.dry_run:
-            monitor = threading.Thread(target=heartbeat, daemon=True)
-            monitor.start()
-        try:
-            status = function()
-            observed[label] = float(time.monotonic() - stage_started)
-            statuses[label] = "dry_run" if args.dry_run else status
-        except BaseException:
-            print(f"[{datetime.now(timezone.utc).isoformat()}] STEP FAILED {label} "
-                  f"elapsed={time.monotonic() - stage_started:.1f}s",
-                  file=sys.stderr, flush=True)
-            raise
-        finally:
-            stop_heartbeat.set()
-            if monitor is not None:
-                monitor.join()
+        print(f"[{datetime.now(timezone.utc).isoformat()}] STEP {len(statuses) + 1}/{len(stages)} START {label}", flush=True)
+        status = function()
+        observed[label] = float(time.monotonic() - stage_started)
+        statuses[label] = "dry_run" if args.dry_run else status
         print(f"[{datetime.now(timezone.utc).isoformat()}] STEP END {label} "
               f"status={statuses[label]} elapsed={observed[label]:.1f}s", flush=True)
 
@@ -825,7 +720,7 @@ def _execute_pipeline(args, paths, invocation_started_utc, invocation_started):
 
 
 # ===========================================================================
-# FastPCA denoising subcommand
+# denoise and select subcommands (run by the pipeline as separate processes)
 # ===========================================================================
 
 def _denoise_parse_args(argv=None):
@@ -847,8 +742,7 @@ def _denoise_parse_args(argv=None):
         type=float,
         help="Optional A/pixel override; default uses RELION metadata",
     )
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--denoise-res", type=int, default=64)
+    parser.add_argument("--denoise-res", type=int, default=DEFAULT_DENOISE_RES)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument(
         "--device", choices=("cpu", "gpu"), default="gpu",
@@ -863,7 +757,6 @@ def _denoise_parse_args(argv=None):
     parser.add_argument("--outdir", dest="output_dir",
                         type=Path, required=True)
     parser.add_argument("--background-radius", type=float, default=0.9)
-    parser.add_argument("--eps", type=float, default=1e-3)
     parser.add_argument(
         "--denoise-max-order", type=int, default=DEFAULT_DENOISE_MAX_ORDER,
         help="largest angular order |nu| of the Fourier-Bessel basis in FastPCA/CWF denoising (the 64 px basis supports 88)")
@@ -880,179 +773,11 @@ def _denoise_parse_args(argv=None):
         default=True,
         help="Flip raw-image sign inside FastPCA (default: enabled)",
     )
-    args = parser.parse_args(argv)
-    args.n_images = 0
-    return args
+    return parser.parse_args(argv)
 
 
 def denoise_main(argv=None):
-    args = _denoise_parse_args(argv)
-    return denoise_relion_particles(
-        FastCWFDenoiseConfig(
-            dataset_label=args.dataset_label,
-            star_path=args.star_path,
-            data_folder=args.data_folder,
-            stack_prefix=args.stack_prefix,
-            native_pixel_size=args.native_pixel_size,
-            n_images=args.n_images,
-            seed=args.seed,
-            denoise_res=args.denoise_res,
-            batch_size=args.batch_size,
-            workers=args.workers,
-            device=args.device,
-            output_dir=args.output_dir,
-            background_radius=args.background_radius,
-            eps=args.eps,
-            denoise_max_order=args.denoise_max_order,
-            ctf_mean_defocus_bin=args.ctf_mean_defocus_bin,
-            flip_sign=args.flip_sign,
-        )
-    )
-
-
-# ===========================================================================
-# Low-crowding selection subcommand
-# ===========================================================================
-
-def scalar(manifest, name):
-    """Read one scalar from an NPZ manifest."""
-    value = np.asarray(manifest[name])
-    return value.reshape(()).item()
-
-
-def optional_text(manifest, name):
-    """Return an optional scalar path/prefix, accepting NPZ spellings of None."""
-    if name not in manifest:
-        return None
-    value = scalar(manifest, name)
-    if value is None:
-        return None
-    text = str(value).strip()
-    return None if text.lower() in {"", "none", "null"} else text
-
-
-def resolve_manifest_path(text, base):
-    path = Path(text).expanduser()
-    if not path.is_absolute():
-        path = base / path
-    return path.resolve(strict=True)
-
-
-def save_selection_diagnostic(images, selected, path, scores=None):
-    """Save a random audit montage with a check or cross beside each image."""
-    images = np.asarray(images)
-    selected = np.asarray(selected, dtype=bool)
-    if scores is not None:
-        scores = np.asarray(scores, dtype=float)
-
-    columns = int(np.ceil(np.sqrt(len(images))))
-    rows = int(np.ceil(len(images) / columns))
-    figure = plt.figure(figsize=(1.45 * columns, 1.25 * rows))
-    outer = figure.add_gridspec(
-        rows, columns, left=0.005, right=0.995, bottom=0.005, top=0.995,
-        wspace=0.08, hspace=0.08)
-    for position in range(rows * columns):
-        row, column = divmod(position, columns)
-        if position >= len(images):
-            axis = figure.add_subplot(outer[row, column])
-            axis.set_axis_off()
-            continue
-        inner = outer[row, column].subgridspec(
-            1, 2, width_ratios=(5.0, 1.0), wspace=0.02)
-        image_axis = figure.add_subplot(inner[0, 0])
-        mark_axis = figure.add_subplot(inner[0, 1])
-        image = images[position]
-        color = "#16883b" if selected[position] else "#c62828"
-        show_particle_image(image_axis, image)
-        image_axis.add_patch(Rectangle(
-            (-0.5, -0.5), image.shape[1], image.shape[0], fill=False,
-            edgecolor=color, linewidth=1.8))
-        image_axis.set_axis_off()
-        if scores is not None:
-            image_axis.text(
-                0.03, 0.03, f"{scores[position]:.3f}",
-                transform=image_axis.transAxes, fontsize=7, color="white",
-                bbox={"facecolor": "black", "alpha": 0.6, "edgecolor": "none",
-                      "pad": 1})
-        mark_axis.set_xlim(0.0, 1.0)
-        mark_axis.set_ylim(0.0, 1.0)
-        mark_axis.set_aspect("equal")
-        mark_axis.set_axis_off()
-        if selected[position]:
-            mark_axis.plot(
-                (0.10, 0.38, 0.90), (0.50, 0.20, 0.82), color=color,
-                linewidth=3.2, solid_capstyle="round", solid_joinstyle="round")
-        else:
-            mark_axis.plot(
-                (0.16, 0.84), (0.16, 0.84), color=color, linewidth=3.2,
-                solid_capstyle="round")
-            mark_axis.plot(
-                (0.16, 0.84), (0.84, 0.16), color=color, linewidth=3.2,
-                solid_capstyle="round")
-    figure.savefig(path.with_suffix(".pdf"), bbox_inches="tight", pad_inches=0)
-    plt.close(figure)
-
-
-SELECTION_OUTPUT_NAMES = (
-    "selection.npz", "selection_report.json", "selected_particles.tsv",
-    "selection_diagnostic.pdf", "selection_scores.pdf",
-    "selection_selected_sample.pdf",
-)
-
-
-def _require_selection_outputs_absent(output: Path) -> None:
-    """Allow denoising files here without overwriting a previous selection."""
-    existing = [name for name in SELECTION_OUTPUT_NAMES
-                if (output / name).exists()]
-    if existing:
-        raise FileExistsError(
-            f"selection output already exists in {output}: {', '.join(existing)}")
-
-
-def save_selected_sample(images, scores, path, columns=20):
-    """Save a montage of selected particles with the crowding score in the corner."""
-    images = np.asarray(images)
-    rows = int(np.ceil(len(images) / columns))
-    figure, axes = plt.subplots(
-        rows, columns, figsize=(1.5 * columns, 1.5 * rows + 0.4), squeeze=False)
-    for axis in axes.ravel():
-        axis.set_axis_off()
-    for axis, image, score in zip(axes.ravel(), images, scores):
-        show_particle_image(axis, image)
-        axis.text(0.03, 0.03, f"{score:.2f}", transform=axis.transAxes,
-                  fontsize=6, color="white",
-                  bbox={"facecolor": "black", "alpha": 0.6,
-                        "edgecolor": "none", "pad": 1})
-    figure.suptitle(f"{len(images)} random selected particles "
-                    "(corner: crowding score)", y=0.998)
-    figure.subplots_adjust(0.003, 0.003, 0.997, 0.97, 0.03, 0.03)
-    figure.savefig(path.with_suffix(".pdf"), dpi=100)
-    plt.close(figure)
-
-
-def save_selection_scores(scores, selected, score_ceiling, path):
-    """Compare selected and rejected image scores using the same histogram bins."""
-    scores = np.asarray(scores, dtype=float)
-    selected = np.asarray(selected, dtype=bool)
-    edges = np.histogram_bin_edges(scores, bins=60)
-    figure, axis = plt.subplots(figsize=(6.0, 4.0))
-    axis.hist([scores[selected], scores[~selected]], bins=edges, stacked=True,
-              color=["#16883b", "#bdbdbd"], label=["Selected", "Not selected"])
-    if np.isfinite(score_ceiling):
-        axis.axvline(score_ceiling, color="#c62828", linestyle="--",
-                     linewidth=1.0, label="Score ceiling")
-    axis.set(xlabel="Crowding score (outer / central signal)", ylabel="Images")
-    axis.legend(frameon=False)
-    figure.tight_layout()
-    figure.savefig(path.with_suffix(".pdf"))
-    plt.close(figure)
-
-
-def manifest_geometry(manifest, manifest_path):
-    """The denoised stack of a denoising manifest with its image count, native and denoised side and native pixel size."""
-    stack_path = resolve_manifest_path(str(scalar(manifest, "denoised_stack")), manifest_path.parent)
-    return (stack_path, int(scalar(manifest, "n_images")), int(scalar(manifest, "native_res")),
-            int(scalar(manifest, "denoise_res")), float(scalar(manifest, "vox_native")))
+    denoise_relion_particles(FastCWFDenoiseConfig(**vars(_denoise_parse_args(argv))))
 
 
 def _selection_parser():
@@ -1064,17 +789,10 @@ def _selection_parser():
     parser.add_argument(
         "--neighbor-distance-fraction", type=float, default=DEFAULT_NEIGHBOR_FRACTION,
         help="minimum pick separation as a fraction of the box (field of view) of the particle images")
-    parser.add_argument("--contrast-bins", type=int, default=4)
     parser.add_argument("--max-score-quantile", type=float, default=0.95)
     parser.add_argument("--auto-score-quantile", action=argparse.BooleanOptionalAction, default=True,
                         help="use the tightest ceiling leaving --n-select candidates (the default); "
                              "--no-auto-score-quantile uses --max-score-quantile instead")
-    parser.add_argument("--smooth-sigma", type=float, default=1.1)
-    parser.add_argument("--inner-radius", type=float, default=0.50)
-    parser.add_argument("--outer-radius-min", type=float, default=0.62)
-    parser.add_argument("--outer-radius-max", type=float, default=0.94)
-    parser.add_argument("--inner-top-fraction", type=float, default=0.20)
-    parser.add_argument("--outer-top-fraction", type=float, default=0.10)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--outdir", dest="output_dir",
                         type=Path, required=True)
@@ -1082,241 +800,7 @@ def _selection_parser():
 
 
 def select_main(argv=None):
-    started = time.monotonic()
-    parser = _selection_parser()
-    args = parser.parse_args(argv)
-
-    output = args.output_dir.resolve()
-    denoising = args.denoising_dir.resolve(strict=True)
-    if output != denoising and output.exists() and any(output.iterdir()):
-        raise FileExistsError("Use a new or empty output directory")
-    _require_selection_outputs_absent(output)
-    output.mkdir(parents=True, exist_ok=True)
-
-    manifest_path = (denoising / "manifest.npz").resolve(strict=True)
-    with np.load(manifest_path, allow_pickle=False) as saved:
-        manifest = {name: saved[name] for name in saved.files}
-    stack_path, count, native_res, side, vox_native = manifest_geometry(manifest, manifest_path)
-    input_loading_done = time.monotonic()
-
-    source_rows = np.asarray(manifest["source_rows"], dtype=np.int64)
-    image_names = np.asarray(manifest["image_names"], dtype=str)
-
-    star_path = resolve_manifest_path(
-        str(scalar(manifest, "star_path")), manifest_path.parent)
-    data_folder_text = optional_text(manifest, "data_folder")
-    data_folder = (resolve_manifest_path(data_folder_text, manifest_path.parent)
-                   if data_folder_text is not None else None)
-    stack_prefix = optional_text(manifest, "stack_prefix")
-    particles = RelionParticles(
-        star_path, data_folder=data_folder, stack_prefix=stack_prefix,
-        pixel_size=vox_native)
-    micrograph_names = np.asarray(
-        particles.metadata["_rlnMicrographName"], dtype=str)
-    # The pick coordinates are in micrograph pixels: their size is the optics column _rlnMicrographPixelSize (written for
-    # Fourier-cropped particle stacks), otherwise the particle pixel size. The threshold is the fraction of the field of view.
-    coordinate_pixel = float(particles.column("_rlnMicrographPixelSize", vox_native)[0])
-    neighbor_distance = args.neighbor_distance_fraction * native_res * vox_native / coordinate_pixel
-    all_neighbor_distances = nearest_particle_distances(
-        micrograph_names, particles.column("_rlnCoordinateX"),
-        particles.column("_rlnCoordinateY"))
-    neighbor_distances = all_neighbor_distances[source_rows]
-    contrast = np.asarray(manifest["contrast_est"], dtype=np.float64)
-    metadata_setup_done = time.monotonic()
-    with mrcfile.mmap(stack_path, mode="r", permissive=False) as stack:
-        selection = select_low_crowding_particles(
-            stack.data, micrograph_names[source_rows], neighbor_distances,
-            contrast, args.n_select,
-            minimum_neighbor_distance=neighbor_distance,
-            contrast_bins=args.contrast_bins,
-            max_score_quantile=args.max_score_quantile,
-            auto_score_ceiling=args.auto_score_quantile,
-            smooth_sigma=args.smooth_sigma,
-            inner_radius=args.inner_radius,
-            outer_radius_min=args.outer_radius_min,
-            outer_radius_max=args.outer_radius_max,
-            inner_top_fraction=args.inner_top_fraction,
-            outer_top_fraction=args.outer_top_fraction,
-            batch_size=args.batch_size,
-            progress=lambda done, total: print(
-                f"  scored {done:,}/{total:,}", flush=True))
-
-    selected_positions = selection.selected_positions
-    rejected_positions = selection.rejected_positions
-    geometry_pass = selection.geometry_pass
-    scores = selection.crowding_scores
-    inner_strength = selection.inner_strength
-    outer_strength = selection.outer_strength
-    score_ceiling = selection.score_ceiling
-    boundaries = selection.contrast_bin_boundaries
-    contrast_ids = selection.contrast_bin_ids
-    micrograph_ids = selection.micrograph_ids
-    stratum_codes = selection.stratum_codes
-    unique_strata = selection.unique_stratum_codes
-    population = selection.stratum_population
-    capacity = selection.stratum_geometry_capacity
-    quotas = selection.stratum_selection_quota
-    selected_mask = np.zeros(count, dtype=bool)
-    selected_mask[selected_positions] = True
-    selection_done = time.monotonic()
-
-    diagnostic_rng = np.random.default_rng(
-        np.random.SeedSequence([args.seed, 0x53454C]))
-    diagnostic_positions = diagnostic_rng.choice(
-        count, args.n_preview, replace=False)
-    diagnostic_selected = selected_mask[diagnostic_positions]
-    with mrcfile.mmap(stack_path, mode="r", permissive=False) as stack:
-        diagnostic_images = np.array(
-            stack.data[diagnostic_positions], dtype=np.float32, copy=True)
-    save_selection_diagnostic(
-        diagnostic_images, diagnostic_selected,
-        output / "selection_diagnostic", scores=scores[diagnostic_positions])
-    save_selection_scores(
-        scores, selected_mask, score_ceiling, output / "selection_scores")
-    sample_positions = np.sort(np.random.default_rng(
-        np.random.SeedSequence([args.seed, 0x53414D])).choice(
-            selected_positions, min(200, len(selected_positions)), replace=False))
-    with mrcfile.mmap(stack_path, mode="r", permissive=False) as stack:
-        sample_images = np.array(
-            stack.data[sample_positions], dtype=np.float32, copy=True)
-    save_selected_sample(
-        sample_images, scores[sample_positions], output / "selection_selected_sample")
-    diagnostic_pdf = output / "selection_diagnostic.pdf"
-
-    dataset = optional_text(manifest, "dataset")
-    source_fingerprint = optional_text(manifest, "source_fingerprint")
-    manifest_hash = sha256_file(manifest_path)
-    np.savez_compressed(
-        output / "selection.npz",
-        selected_positions=selected_positions,
-        selected_source_rows=source_rows[selected_positions],
-        selected_image_names=image_names[selected_positions],
-        rejected_positions=rejected_positions,
-        geometry_pass_positions=np.flatnonzero(geometry_pass),
-        diagnostic_positions=diagnostic_positions,
-        diagnostic_selected=diagnostic_selected,
-        crowding_scores=scores,
-        inner_strength=inner_strength,
-        outer_strength=outer_strength,
-        nearest_neighbor_distance_coordinate_pixels=neighbor_distances,
-        contrast_bin_boundaries=boundaries,
-        contrast_bin_ids=contrast_ids,
-        stratum_codes=stratum_codes,
-        unique_stratum_codes=unique_strata,
-        stratum_population=population,
-        stratum_geometry_capacity=capacity,
-        stratum_selection_quota=quotas,
-        effective_contrast_bins=len(np.unique(contrast_ids)),
-        dataset="" if dataset is None else dataset,
-        source_fingerprint="" if source_fingerprint is None else source_fingerprint,
-        input_manifest=str(manifest_path),
-        input_manifest_sha256=manifest_hash,
-        input_stack=str(stack_path),
-        native_res=native_res,
-        native_pixel_size_angstrom=vox_native,
-        minimum_neighbor_distance_fraction=args.neighbor_distance_fraction,
-        coordinate_pixel_size_angstrom=coordinate_pixel,
-        minimum_neighbor_distance_coordinate_pixels=neighbor_distance,
-    )
-    with (output / "selected_particles.tsv").open("w") as stream:
-        stream.write(
-            "denoised_position\tstar_row_zero_based\timage_name\t"
-            "crowding_score\tnearest_neighbor_coordinate_pixels\n")
-        for position in selected_positions:
-            stream.write(
-                f"{position}\t{source_rows[position]}\t{image_names[position]}\t"
-                f"{scores[position]:.9g}\t{neighbor_distances[position]:.9g}\n")
-
-    selection_path = output / "selection.npz"
-    before_report_write = time.monotonic()
-    timings = {
-        "input_and_manifest_loading": input_loading_done - started,
-        "metadata_and_neighbor_setup": (
-            metadata_setup_done - input_loading_done),
-        "scoring_and_selection": selection_done - metadata_setup_done,
-        "diagnostic_and_output_writing": before_report_write - selection_done,
-    }
-    report = {
-        "dataset": dataset,
-        "input_stack": str(stack_path),
-        "input_manifest": str(manifest_path),
-        "input_manifest_sha256": manifest_hash,
-        "selection_sha256": sha256_file(selection_path),
-        "source_fingerprint": source_fingerprint,
-        "source_star": str(star_path),
-        "source_data_folder": None if data_folder is None else str(data_folder),
-        "source_stack_prefix": stack_prefix,
-        "n_input": count,
-        "n_requested": args.n_select,
-        "n_selected": int(len(selection.selected_positions)),
-        "selected_fraction": len(selection.selected_positions) / count,
-        "native_box_pixels": native_res,
-        "native_pixel_size_angstrom": vox_native,
-        "native_box_size_angstrom": native_res * vox_native,
-        "smooth_sigma_pixels_at_denoise_resolution": args.smooth_sigma,
-        "minimum_neighbor_distance_fraction_of_native_box": args.neighbor_distance_fraction,
-        "coordinate_pixel_size_angstrom": coordinate_pixel,
-        "minimum_neighbor_distance_coordinate_pixels": neighbor_distance,
-        "score_quantile_mode": "auto" if args.auto_score_quantile else "fixed",
-        "maximum_crowding_score_quantile": (
-            float(np.mean(scores <= score_ceiling)) if args.auto_score_quantile
-            else args.max_score_quantile),
-        "maximum_crowding_score": score_ceiling,
-        "n_passing_geometry_and_score_gates": int(geometry_pass.sum()),
-        "n_micrographs": int(len(np.unique(micrograph_ids))),
-        "n_populated_micrograph_contrast_strata": int(len(unique_strata)),
-        "contrast_bins": args.contrast_bins,
-        "effective_contrast_bins": int(len(np.unique(contrast_ids))),
-        "contrast_bin_boundaries": boundaries.tolist(),
-        "inner_radius_fraction": args.inner_radius,
-        "outer_radius_fraction": [args.outer_radius_min, args.outer_radius_max],
-        "inner_top_fraction": args.inner_top_fraction,
-        "outer_top_fraction": args.outer_top_fraction,
-        "selected_score_quantiles": {
-            str(q): float(np.quantile(scores[selected_positions], q))
-            for q in (0, 0.1, 0.5, 0.9, 0.99, 1)},
-        "score_quantiles": {
-            str(q): float(np.quantile(scores, q))
-            for q in (0, 0.01, 0.1, 0.2, 0.5, 0.8, 0.9, 0.99, 1)},
-        "preview_seed": args.seed,
-        "n_preview": args.n_preview,
-        "selection_diagnostic": {
-            "seed_sequence": [args.seed, 0x53454C],
-            "n_images": int(len(diagnostic_positions)),
-            "n_selected": int(np.sum(diagnostic_selected)),
-            "n_not_selected": int(np.sum(~diagnostic_selected)),
-            "pdf": str(diagnostic_pdf),
-            "pdf_sha256": sha256_file(diagnostic_pdf),
-        },
-        "score_plot": {
-            "pdf": str(output / "selection_scores.pdf"),
-        },
-        "elapsed_seconds": before_report_write - started,
-        "timings_seconds": timings,
-        "provenance": {
-            "kam_cryoem_commit": git_commit(ROOT),
-            "python": sys.version,
-            "numpy": np.__version__,
-        },
-    }
-    report_path = output / "selection_report.json"
-    # Write once so the measured output stage includes a real JSON
-    # serialization and filesystem write, then patch in the final timings.
-    report_path.write_text(json.dumps(report, indent=2) + "\n")
-    report_checkpoint = time.monotonic()
-    timings["diagnostic_and_output_writing"] = (
-        report_checkpoint - selection_done)
-    report["elapsed_seconds"] = report_checkpoint - started
-    report_path.write_text(json.dumps(report, indent=2) + "\n")
-    print(
-        "Selection timing: "
-        f"input={timings['input_and_manifest_loading']:.1f}s, "
-        f"metadata={timings['metadata_and_neighbor_setup']:.1f}s, "
-        f"scoring={timings['scoring_and_selection']:.1f}s, "
-        f"outputs={timings['diagnostic_and_output_writing']:.1f}s, "
-        f"total={report['elapsed_seconds']:.1f}s",
-        flush=True)
-    print(json.dumps(report, indent=2), flush=True)
+    select_particles(**vars(_selection_parser().parse_args(argv)))
 
 
 def _reconstruct_parser() -> argparse.ArgumentParser:
@@ -1343,8 +827,6 @@ def _reconstruct_parser() -> argparse.ArgumentParser:
 
 
 def reconstruct_main(argv=None):
-    from .moments import use_device
-
     args = _reconstruct_parser().parse_args(argv)
     with mrcfile.open(args.stack, permissive=True) as handle:
         images = np.asarray(handle.data, dtype=np.float32)
@@ -1353,18 +835,16 @@ def reconstruct_main(argv=None):
     root = args.outdir.resolve()
     use_device(args.device)
     print(f"[reconstruct] {len(images)} images of {images.shape[-1]} px at {pixel:.4g} A -> moments on {args.moment_res} px", flush=True)
-    postprocessing.prepare_moments_from_images(
+    prepare_moments_from_images(
         images, pixel, root / "prepared", moment_res=args.moment_res, ell_max=args.ell_max, batch_size=args.batch_size,
         dataset=args.stack.stem, source=args.stack.resolve())
     del images
-    from . import shift_distribution
-
     for order in (1, 2, 3):
         if order == 3:
-            shift_distribution.select_m2_start(root / "prepared", root / "M2", root / "M2_selected", ell_max=args.ell_max,
-                                               viewing_degree=args.viewing_degree, symmetry=args.symmetry, device=args.device)
+            select_m2_start(root / "prepared", root / "M2", root / "M2_selected", ell_max=args.ell_max,
+                            viewing_degree=args.viewing_degree, symmetry=args.symmetry, device=args.device)
         print(f"[reconstruct] M{order}", flush=True)
-        _reconstruct_order(ReconstructionConfig(
+        reconstruct_order(ReconstructionConfig(
             prepared_dir=root / "prepared", output_dir=root / f"M{order}", order=order,
             ell_max=args.ell_max, viewing_degree=args.viewing_degree, symmetry=args.symmetry,
             n_init=1 if order == 3 else N_INIT, maxiter=_maxiter(order), device=args.device, seed=args.seed,

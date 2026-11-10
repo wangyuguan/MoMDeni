@@ -1,17 +1,102 @@
-"""Low-degree positive viewing distributions for moment reconstruction.
+"""The distribution of viewing directions.
 
-The viewing distribution is represented on oriented :math:`S^2`, with a
-uniform in-plane angle.  Squared real spherical-harmonic features give a
-positive density of degree 0, 2, or 4 relative to Haar measure.
+The in-plane angle is uniform, so the distribution is a density on the sphere of viewing directions. :func:`viewing_grid` gives a quadrature
+grid on S^2 with positive weights, and :class:`LowDegreeViewingDensity` a positive density on it: a sum of squares of real spherical
+harmonics of degree 0, 2 or 4, symmetric under v -> -v.
 """
 
 from __future__ import annotations
 
+import os
+import re
+
 import numpy as np
-from scipy.optimize import minimize
 from scipy.special import gammaln, lpmv
 
-from .moments import fb_objective_and_grad
+
+class ViewingGrid:
+    """Viewing directions of an S^2 quadrature (the in-plane angle is integrated out by the FB moments).
+
+    Attributes
+    ----------
+    rots : (Ns, 3, 3)    one rotation per node, with the node direction as its third column
+    Ns : int             number of nodes
+    q : (Ns,)            probability masses for uniform surface measure
+    xyz : (Ns, 3)        node directions (unit vectors)
+    """
+
+    def __init__(self, rots, q, xyz):
+        self.rots = rots
+        self.Ns = len(q)
+        self.q = q
+        self.xyz = xyz
+
+
+SPHERE_RULE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "sphere_rules")
+_RULE_CACHE = {}
+
+
+def _sphere_rules():
+    """Load and cache the precomputed S^2 quadrature catalogue.
+
+    Files contain rows ``x y z w`` after two header lines. Nodes are normalized
+    to the unit sphere and weights to unit sum. Each rule records whether all
+    weights are positive. The returned catalogue is sorted by degree.
+    """
+    if _RULE_CACHE:
+        return _RULE_CACHE["rules"]
+    rules = []
+    for path in sorted(os.listdir(SPHERE_RULE_DIR)):
+        m = re.match(r"N(\d+)_M(\d+)_(\w+)\.dat$", path)
+        if not m:
+            continue
+        d = np.genfromtxt(os.path.join(SPHERE_RULE_DIR, path), skip_header=2)
+        xyz, w = np.atleast_2d(d)[:, :3], np.atleast_1d(np.atleast_2d(d)[:, 3])
+        rules.append({"degree": int(m.group(1)), "n": w.size,
+                      "symmetry": m.group(3), "file": path,
+                      "xyz": xyz / np.linalg.norm(xyz, axis=1, keepdims=True),
+                      "q": w / w.sum(), "positive": bool(np.all(w > 0))})
+    rules.sort(key=lambda r: r["degree"])
+    _RULE_CACHE["rules"] = rules
+    return rules
+
+
+def sphere_quadrature(degree):
+    """Select the smallest positive-weight Gauss quadrature on S^2 of at least this polynomial degree.
+
+    Rules with negative weights are excluded because the weights define a
+    probability mass over viewing directions.
+
+    Returns polar angles, azimuths, normalized weights, and unit directions.
+    """
+    usable = [r for r in _sphere_rules() if r["positive"] and r["degree"] >= degree]
+    rule = min(usable, key=lambda r: r["n"])
+    xyz = rule["xyz"]
+    theta = np.arccos(np.clip(xyz[:, 2], -1.0, 1.0))
+    phi = np.arctan2(xyz[:, 1], xyz[:, 0])
+    return theta, phi, rule["q"].copy(), xyz.copy()
+
+
+def viewing_grid(degree):
+    """The viewing directions of :func:`sphere_quadrature` as rotations with the node direction as third column."""
+    th, ph, q, xyz = sphere_quadrature(degree)
+    rots = np.empty((th.size, 3, 3))
+    for a in range(th.size):
+        rots[a] = Rz(ph[a]) @ Ry(th[a])
+    return ViewingGrid(rots, q, xyz)
+
+
+def Rz(a):
+    c, s = np.cos(a), np.sin(a)
+    return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+
+
+def Ry(a):
+    c, s = np.cos(a), np.sin(a)
+    return np.array([[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]])
+
+
 
 
 def real_spherical_harmonics(directions, degree):
@@ -91,13 +176,9 @@ class LowDegreeViewingDensity:
             * real_spherical_harmonics(grid.xyz, self.degree),
         ))
 
-    def _beta(self, beta):
-        beta = np.asarray(beta, dtype=np.float64)
-        return beta
-
     def _components(self, beta):
         matrix = np.eye(self.n_features)
-        matrix[self.rows, self.cols] += self._beta(beta)
+        matrix[self.rows, self.cols] += np.asarray(beta, dtype=np.float64)
         values = self.H @ matrix.T
         power = np.sum(values**2, axis=1)
         trace = float(np.sum(matrix**2))
@@ -116,7 +197,7 @@ class LowDegreeViewingDensity:
             np.ones(len(harmonics)), np.sqrt(4 * np.pi) * harmonics,
         ))
         matrix = np.eye(self.n_features)
-        matrix[self.rows, self.cols] += self._beta(beta)
+        matrix[self.rows, self.cols] += np.asarray(beta, dtype=np.float64)
         power = np.sum((features @ matrix.T)**2, axis=1)
         return power / trace
 
@@ -139,7 +220,7 @@ class LowDegreeViewingDensity:
     def evaluate(self, beta):
         """Return normalization, concentration, and SH diagnostics."""
 
-        beta = self._beta(beta)
+        beta = np.asarray(beta, dtype=np.float64)
         _, power, trace, normalization = self._components(beta)
         relative_density = power / trace
         p = self.q * power / normalization
@@ -168,86 +249,3 @@ class LowDegreeViewingDensity:
             viewing_sh_moments=moments.tolist(),
             viewing_sh_power_by_degree=moment_power,
         )
-
-
-def _single_order_weights(lambdas):
-    """The loss weights as arrays and the (1-based) order of the single active moment."""
-    weights = [np.asarray(value, dtype=float) for value in lambdas]
-    order = next(order for order, weight in enumerate(weights, 1) if np.any(weight > 0))
-    return weights, order
-
-
-def fit_single_moment_low_degree(
-        param, grid, targets, lambdas, theta0, beta0=None,
-        degree=2, maxiter=5000, print_every=100):
-    """Fit exactly one moment order over volume and viewing parameters.
-
-    Returns the volume coefficients, viewing parameters and masses, the optimizer result, the relative misfit of
-    the active moment and the viewing-density diagnostics.
-    """
-
-    targets = tuple(targets)
-    weights, order = _single_order_weights(lambdas)
-    density = LowDegreeViewingDensity(grid, degree=degree)
-    theta0 = np.asarray(theta0, dtype=np.float64)
-    ntheta = param.n_params
-    if beta0 is None:
-        beta0 = np.zeros(density.n_parameters)
-    x0 = np.r_[theta0, density._beta(beta0)]
-    target_norm = max(
-        float(np.linalg.norm(np.ravel(targets[order - 1]))), 1e-30)
-    state = dict(nit=0, nfev=0)
-
-    def objective(x):
-        p = density.pmf(x[ntheta:])
-        value, gtheta, gp, info = fb_objective_and_grad(
-            x[:ntheta], p, param, *targets,
-            lambdas=weights, return_info=True,
-        )
-        gradient = np.r_[gtheta, density.vjp(x[ntheta:], gp)]
-        state.update(
-            f=value,
-            gnorm=float(np.linalg.norm(gradient)),
-            relative_error=float(info[f"misfit{order}"] / target_norm),
-        )
-        state["nfev"] += 1
-        return value, gradient
-
-    def callback(_):
-        state["nit"] += 1
-        if print_every and state["nit"] % print_every == 0:
-            print(
-                f"    [m{order} SOS{density.degree}] it={state['nit']:5d} "
-                f"nfev={state['nfev']:5d} f={state['f']:.6e} "
-                f"|g|={state['gnorm']:.2e} "
-                f"rel m{order}={state['relative_error']:.2e}",
-                flush=True,
-            )
-
-    options = dict(
-        maxiter=int(maxiter), maxfun=max(15000, 20 * int(maxiter)),
-        ftol=1e-11, gtol=1e-10, maxcor=100,
-    )
-    result = minimize(
-        objective, x0, jac=True, method="L-BFGS-B", callback=callback,
-        options=options,
-    )
-    x = np.asarray(result.x, dtype=float).copy()
-    theta, beta = x[:ntheta].copy(), x[ntheta:].copy()
-    p = density.pmf(beta)
-    diagnostics = density.evaluate(beta)
-    _, _, _, info = fb_objective_and_grad(
-        theta, p, param, *targets, lambdas=weights, return_info=True,
-    )
-    if print_every:
-        print(
-            f"  [m{order} SOS{density.degree}] f={result.fun:.6e} "
-            f"nit={result.nit:5d} nfev={result.nfev:5d} "
-            f"{result.message}",
-            flush=True,
-        )
-    return dict(
-        theta=theta, beta=beta, p=p, res=result,
-        relative_error=float(info[f"misfit{order}"] / target_norm),
-        viewing_diagnostics=diagnostics,
-    )

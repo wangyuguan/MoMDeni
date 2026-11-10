@@ -1,10 +1,10 @@
-"""Run-log capture, particle display, MRC volume I/O and the CUDA device helpers."""
+"""Helpers shared by the modules: run log, hashes and provenance, JSON and MRC output, image display, centered FFTs and the compute device."""
 
 from contextlib import contextmanager
 import hashlib
+import json
 import os
 from pathlib import Path
-import select
 import subprocess
 import sys
 import threading
@@ -14,19 +14,12 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[2]
 
 
-class _WriteThroughStream:
-    """Flush Python writes immediately while preserving stream attributes."""
+def write_json(path, value):
+    Path(path).write_text(json.dumps(value, indent=2, allow_nan=False) + "\n")
 
-    def __init__(self, stream):
-        self._stream = stream
 
-    def write(self, text):
-        result = self._stream.write(text)
-        self._stream.flush()
-        return result
-
-    def __getattr__(self, name):
-        return getattr(self._stream, name)
+def sha256_array(value):
+    return hashlib.sha256(np.ascontiguousarray(value).tobytes()).hexdigest()
 
 
 def sha256_file(path):
@@ -45,166 +38,52 @@ def git_commit(path):
 
 @contextmanager
 def capture_run_log(path):
-    """Append stdout/stderr to ``path`` while retaining live terminal output.
-
-    Capture operates on file descriptors, including inherited subprocess and
-    native writes. Python streams flush each write. Use this process-wide
-    context from the main thread, and wait for child processes before leaving
-    it. Separate stdout/stderr streams retain their own ordering; simultaneous
-    writes from different streams have no defined ordering in the merged log.
-    """
+    """Copy everything written to stdout and stderr, subprocess output included, to the file ``path`` while it still reaches the terminal."""
     path = Path(path).expanduser().resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
-    log_fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
-    streams = (sys.stdout, sys.stderr)
-    saved_fds = {}
-    redirected = []
-    threads = []
-    stop = threading.Event()
-    log_lock = threading.Lock()
-    errors = []
+    log = open(path, "ab", buffering=0)
+    lock = threading.Lock()
+    streams = sys.stdout, sys.stderr
+    for stream in streams:
+        stream.flush()
 
-    def write_all(fd, data):
-        remaining = memoryview(data)
-        while remaining:
-            written = os.write(fd, remaining)
-            remaining = remaining[written:]
+    def tee(read_fd, terminal_fd):
+        while data := os.read(read_fd, 65536):
+            os.write(terminal_fd, data)
+            with lock:
+                log.write(data)
+        os.close(read_fd)
 
-    def drain(read_fd, terminal_fd):
-        terminal_active = True
-        log_active = True
-        pending = bytearray()
-
-        def append_log(data):
-            nonlocal log_active
-            if log_active:
-                try:
-                    with log_lock:
-                        write_all(log_fd, data)
-                except OSError as error:
-                    errors.append(error)
-                    log_active = False
-
-        try:
-            while True:
-                ready, _, _ = select.select([read_fd], [], [], 0.1)
-                if not ready:
-                    if pending:
-                        append_log(pending)
-                        pending.clear()
-                    if stop.is_set():
-                        break
-                    continue
-                data = os.read(read_fd, 65536)
-                if not data:
-                    break
-                if log_active:
-                    pending.extend(data)
-                    line_end = max(pending.rfind(b"\n"), pending.rfind(b"\r")) + 1
-                    if line_end:
-                        append_log(pending[:line_end])
-                        del pending[:line_end]
-                    elif len(pending) >= 65536:
-                        append_log(pending)
-                        pending.clear()
-                if terminal_active:
-                    try:
-                        write_all(terminal_fd, data)
-                    except OSError as error:
-                        errors.append(error)
-                        terminal_active = False
-        except OSError as error:
-            errors.append(error)
-        finally:
-            if pending:
-                append_log(pending)
-            os.close(read_fd)
-
+    saved, threads = {}, []
+    for fd in (1, 2):
+        saved[fd] = os.dup(fd)
+        read_fd, write_fd = os.pipe()
+        threads.append(threading.Thread(target=tee, args=(read_fd, saved[fd]), daemon=True))
+        threads[-1].start()
+        os.dup2(write_fd, fd)
+        os.close(write_fd)
+    sys.stdout = open(1, "w", buffering=1, closefd=False)
+    sys.stderr = open(2, "w", buffering=1, closefd=False)
     try:
-        for stream in streams:
-            stream.flush()
-        for fd in (1, 2):
-            saved_fds[fd] = os.dup(fd)
-            read_fd, write_fd = os.pipe()
-            worker = threading.Thread(
-                target=drain, args=(read_fd, saved_fds[fd]), daemon=True,
-                name=f"run-log-{fd}")
-            try:
-                worker.start()
-            except BaseException:
-                os.close(read_fd)
-                os.close(write_fd)
-                raise
-            threads.append(worker)
-            try:
-                os.dup2(write_fd, fd)
-                redirected.append(fd)
-            finally:
-                os.close(write_fd)
-        sys.stdout, sys.stderr = (_WriteThroughStream(s) for s in streams)
         yield path
-    finally:
-        active_exception = sys.exc_info()[0] is not None
-        for stream in (sys.stdout, sys.stderr):
-            try:
-                stream.flush()
-            except (OSError, ValueError) as error:
-                errors.append(error)
+    finally:      # restore the terminal; the pipes then reach end-of-file and the copying threads finish
+        sys.stdout.flush()
+        sys.stderr.flush()
         sys.stdout, sys.stderr = streams
-        for fd in reversed(redirected):
-            os.dup2(saved_fds[fd], fd)
-        stop.set()
-        for worker in threads:
-            worker.join()
-        for fd in saved_fds.values():
+        for fd in (1, 2):
+            os.dup2(saved[fd], fd)
+        for thread in threads:
+            thread.join()
+        for fd in saved.values():
             os.close(fd)
-        os.close(log_fd)
-        if errors:
-            message = f"run log encountered an output error: {errors[0]}"
-            if active_exception:
-                try:
-                    os.write(2, (message + "\n").encode())
-                except OSError:
-                    pass
-            else:
-                raise OSError(message) from errors[0]
+        log.close()
 
 
 def show_particle_image(axis, image):
     """Display a particle with per-image 1--99% grayscale limits."""
-    image = np.asarray(image)
     lo, hi = np.percentile(image, (1, 99))
-    if hi <= lo:
-        lo, hi = float(image.min()), float(image.max())
-    if hi <= lo:
-        width = max(1.0, abs(lo)) * 0.5
-        lo, hi = lo - width, hi + width
     return axis.imshow(image, cmap="gray", vmin=lo, vmax=hi,
                        interpolation="nearest", origin="upper")
-
-
-def load_volume(path):
-    """Read a 3-D MRC map and its isotropic voxel size in Angstrom."""
-    import mrcfile
-    with mrcfile.open(path, permissive=True) as m:
-        vol = np.array(m.data, dtype=np.float64)
-        axis_mapping = (
-            int(m.header.mapc), int(m.header.mapr), int(m.header.maps))
-        voxel_xyz = np.array([
-            float(m.voxel_size.x),
-            float(m.voxel_size.y),
-            float(m.voxel_size.z),
-        ])
-    # Convert MRC (section, row, column) storage to canonical (z, y, x) order.
-    stored_physical_axes = (axis_mapping[2], axis_mapping[1], axis_mapping[0])
-    permutation = tuple(stored_physical_axes.index(axis) for axis in (3, 2, 1))
-    if permutation != (0, 1, 2):
-        vol = np.ascontiguousarray(np.transpose(vol, permutation))
-    if not np.allclose(voxel_xyz, voxel_xyz[0], rtol=1e-5, atol=1e-7):
-        raise ValueError(
-            "alignment requires isotropic MRC voxels, but the header for "
-            f"{path} gives {voxel_xyz.tolist()} Angstrom")
-    return vol, float(np.mean(voxel_xyz))
 
 
 def save_mrc(vol, path, voxel_size):
@@ -215,26 +94,43 @@ def save_mrc(vol, path, voxel_size):
         m.voxel_size = voxel_size
 
 
-def fourier_resample_real(volume, target_side):
-    """Resample a centered real cube by separable Fourier interpolation; also returns the relative imaginary part that was dropped."""
-    from scipy import signal
-    volume = np.asarray(volume, dtype=np.float64)
-    if volume.shape[0] == target_side:
-        return np.array(volume, copy=True), 0.0
-    result = np.fft.ifftshift(volume)
-    for axis in range(3):
-        result = signal.resample(result, target_side, axis=axis, window=None)
-    result = np.fft.fftshift(result)
-    imaginary_norm = float(np.linalg.norm(np.imag(result)))
-    result = np.asarray(np.real(result), dtype=np.float64)
-    return result, imaginary_norm / max(float(np.linalg.norm(result)), np.finfo(float).tiny)
+def centered_fft2(img):
+    """Centered two-dimensional forward FFT."""
+    return np.fft.fftshift(np.fft.fft2(np.fft.ifftshift(img, axes=(-2, -1)), axes=(-2, -1)), axes=(-2, -1))
+
+
+def centered_ifft2(fimg):
+    """Centered 2-D inverse FFT (inverse of :func:`centered_fft2`)."""
+    return np.fft.fftshift(np.fft.ifft2(np.fft.ifftshift(fimg, axes=(-2, -1)), axes=(-2, -1)), axes=(-2, -1))
+
+
+def centered_ifftn(fvol):
+    """Centered n-D inverse FFT."""
+    return np.fft.fftshift(np.fft.ifftn(np.fft.ifftshift(fvol)))
+
+
+def centered_coords_1d(L):
+    """Integer frequency coordinate at each array index of a centered grid: index ``a`` holds ``a - L//2``."""
+    return np.arange(L) - (L // 2)
 
 
 # ===========================================================================
-# CUDA device helpers
+# Compute device
 # ===========================================================================
 
+_DEVICE = "cpu"
 _TORCH = None
+
+
+def use_device(name):
+    """Select the device ('cpu' or 'gpu') of the moment and projection kernels; 'gpu' needs PyTorch with CUDA."""
+    global _DEVICE
+    _DEVICE = name
+    return _DEVICE
+
+
+def on_gpu():
+    return _DEVICE == "gpu"
 
 
 def _gpu_torch():

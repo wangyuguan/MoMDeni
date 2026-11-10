@@ -1,21 +1,16 @@
-"""Reusable CWF denoising of RELION particle stacks with FastPCA.
+"""Particle images: reading RELION stacks, CWF denoising and the selection of the least crowded particles.
 
-Includes the CUDA FLE transforms behind a lazy factory, so importing this module never requires fle_2d or CuPy.
-
-The output is a CTF-corrected stack in unwhitened, amplitude-preserving units.
-The radial FastPCA CTF uses mean defocus, optionally quantized into bins.  The
-manifest retains the original per-particle CTF metadata and describes both the
-astigmatism and defocus-quantization approximations.
-
-No RELION pose, origin, reference map, or clean projection is used, and the images are not shifted.
-Downstream moment estimation must treat the saved images as clean latent images:
-do not apply CTF correction or noise debiasing a second time.
+:class:`RelionParticles` reads the images of a STAR file without applying poses or intensity corrections. :func:`denoise_relion_particles`
+Fourier-crops them, denoises them by FastPCA covariance Wiener filtering (radial CTF at the mean defocus) and writes CTF-corrected,
+amplitude-preserving images together with a manifest of their CTF parameters and provenance. :func:`select_particles` keeps the particles
+whose denoised images show the least signal of neighbouring particles. No poses, reference maps or image shifts are used.
 """
 
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -23,13 +18,21 @@ import sys
 import time
 from types import SimpleNamespace
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # noqa: E402
+from matplotlib.patches import Rectangle
+import mrcfile
 import numpy as np
+from scipy.ndimage import gaussian_filter
+from scipy.spatial import cKDTree
 
-from .utils import ROOT, git_commit
+from .utils import ROOT, centered_fft2, centered_ifft2, git_commit, sha256_file, show_particle_image
 
 # git submodules checked out next to src/ (git clone --recursive)
 FAST_PCA_ROOT = ROOT / "fast-cryoEM-PCA"
 FLE_ROOT = ROOT / "fle_2d"
+DEFAULT_DENOISE_RES = 64
 DEFAULT_DENOISE_MAX_ORDER = 40
 CTF_COLUMNS = (
     "_rlnVoltage",
@@ -47,6 +50,98 @@ RADIAL_CTF_COLUMNS = (
 )
 
 
+class RelionParticles:
+    """Read particle pixels without applying STAR poses or intensity corrections.
+
+    Stack paths are relative to ``data_folder`` (the STAR directory by default).
+    ``stack_prefix`` optionally strips one exact leading relative directory
+    prefix from every STAR stack path, for datasets stored in a flattened root.
+    It must be slash-separated, without a trailing slash or ``.``/``..`` parts.
+    Original image names and metadata are retained unchanged.
+    ``pixel_size`` explicitly overrides the sampling in Angstroms; the STAR
+    value remains available as ``metadata_pixel_size`` and in ``metadata``.
+    All particles must share a square grid and pixel size. Optics metadata are
+    merged into the particle table with ASPIRE's RELION STAR reader.
+    """
+
+    def __init__(self, star_path, data_folder=None, stack_prefix=None, pixel_size=None):
+        from aspire.utils import RelionStarFile
+
+        self.star_path = Path(star_path).resolve(strict=True)
+        root = self.star_path.parent if data_folder is None else Path(data_folder).resolve(strict=True)
+        self.metadata = RelionStarFile(str(self.star_path)).get_merged_data_block()
+        self.image_names = np.asarray(self.metadata["_rlnImageName"], dtype=str)
+        self.n = len(self.image_names)
+        parts = [name.split("@", 1) for name in self.image_names]
+        self.stack_indices = np.array([int(part[0]) - 1 for part in parts])
+        names, self.stack_ids = np.unique([part[1] for part in parts], return_inverse=True)
+        if stack_prefix is not None:
+            names = [name[len(stack_prefix) + 1:] for name in names]
+        self.stack_paths = [root / name for name in names]
+        if "_rlnImagePixelSize" in self.metadata:
+            self.metadata_pixel_size = float(self.column("_rlnImagePixelSize")[0])
+        else:
+            self.metadata_pixel_size = float(1e4 * self.column("_rlnDetectorPixelSize")[0] / self.column("_rlnMagnification")[0])
+        self.pixel_size = self.metadata_pixel_size if pixel_size is None else float(pixel_size)
+        with mrcfile.mmap(self.stack_paths[0], mode="r") as stack:
+            self.res = int(stack.data.shape[-1])
+
+    def column(self, name, default=None):
+        """A numeric metadata column, or ``default`` for every particle if the STAR file does not have it."""
+        if name not in self.metadata and default is not None:
+            return np.full(self.n, default, dtype=np.float64)
+        return np.asarray(self.metadata[name], dtype=np.float64)
+
+    def read(self, indices):
+        """Read zero-based STAR rows in the requested order, using memory maps."""
+        indices = np.asarray(indices)
+        images = np.empty((len(indices), self.res, self.res), dtype=np.float32)
+        for stack_id in np.unique(self.stack_ids[indices]):
+            positions = np.flatnonzero(self.stack_ids[indices] == stack_id)
+            stack_indices = self.stack_indices[indices[positions]]
+            with mrcfile.mmap(self.stack_paths[stack_id], mode="r") as stack:
+                data = stack.data
+                if data.ndim == 2:
+                    data = data[None]
+                images[positions] = data[stack_indices]
+        return images
+
+    def fingerprint(self):
+        """Identify STAR contents and the referenced stacks without hashing all pixels."""
+        digest = hashlib.sha256(self.star_path.read_bytes())
+        for path in self.stack_paths:
+            stat = path.stat()
+            digest.update(f"{path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}".encode())
+        return digest.hexdigest()
+
+
+def downsample_fourier_images(images, ds_res):
+    """Fourier crop raw particles, preserving their field of view and amplitude.
+
+    The output contains centered, unnormalized 2-D Fourier coefficients.
+    Multiplication by ``(ds_res/native_res)**2`` keeps the amplitude of the cropped coefficients.
+    For even sizes, zero the unpaired Nyquist row/column; the reconstruction
+    disk excludes these edges. No mean subtraction or normalization is applied.
+    """
+    images = np.asarray(images)
+    native_res = images.shape[-1]
+    ds_res = int(ds_res)
+    start = native_res // 2 - ds_res // 2
+    # NumPy 2 preserves float32 FFT precision; promote before transforming so
+    # the cached complex128 moments retain an accurately accumulated DC term.
+    fourier = centered_fft2(np.asarray(images, dtype=np.float64))
+    cropped = fourier[:, start:start + ds_res, start:start + ds_res].copy()
+    cropped *= (ds_res / native_res) ** 2
+    if ds_res % 2 == 0:
+        cropped[:, 0, :] = 0
+        cropped[:, :, 0] = 0
+    return cropped
+
+
+# ===========================================================================
+# CWF denoising
+# ===========================================================================
+
 @dataclass(frozen=True)
 class FastCWFDenoiseConfig:
     """Inputs and numerical settings for :func:`denoise_relion_particles`."""
@@ -57,9 +152,7 @@ class FastCWFDenoiseConfig:
     data_folder: Path | None = None
     stack_prefix: str | None = None
     native_pixel_size: float | None = None
-    n_images: int = 0
-    seed: int = 0
-    denoise_res: int = 64
+    denoise_res: int = DEFAULT_DENOISE_RES
     batch_size: int = 256
     workers: int = 1
     device: str = "gpu"
@@ -68,34 +161,6 @@ class FastCWFDenoiseConfig:
     denoise_max_order: int = DEFAULT_DENOISE_MAX_ORDER
     ctf_mean_defocus_bin: float = 50.0
     flip_sign: bool = True
-
-
-@dataclass(frozen=True)
-class FastCWFDenoiseResult:
-    """Paths and key dimensions produced by CWF denoising."""
-
-    output_dir: Path
-    stack_path: Path
-    manifest_path: Path
-    report_path: Path
-    n_images: int
-    n_total: int
-    native_res: int
-    denoise_res: int
-    native_pixel_size: float
-    denoise_pixel_size: float
-    elapsed_seconds: float
-
-
-def select_rows(n_total, n_images, seed):
-    """Select rows without replacement and return canonical STAR order.
-
-    ``n_images=0`` selects the complete STAR table without invoking the RNG.
-    """
-    if n_images == 0:
-        return np.arange(n_total, dtype=np.int64)
-    rows = np.random.default_rng(seed).choice(n_total, size=n_images, replace=False)
-    return np.sort(rows).astype(np.int64)
 
 
 def group_radial_ctfs(parameters, mean_defocus_bin):
@@ -236,8 +301,8 @@ def denoise_fastpca_batches(fast_pca, mean_est, covar_est, batch_size):
     return images, contrast
 
 
-def denoise_relion_particles(config: FastCWFDenoiseConfig) -> FastCWFDenoiseResult:
-    """Denoise a reproducibly selected RELION particle subset.
+def denoise_relion_particles(config: FastCWFDenoiseConfig):
+    """Denoise all particles of a RELION STAR file.
 
     The function writes ``denoised_images.mrcs``, ``manifest.npz``,
     ``report.json``, and ``denoising_preview.pdf`` to a new output directory. Returned
@@ -258,28 +323,23 @@ def denoise_relion_particles(config: FastCWFDenoiseConfig) -> FastCWFDenoiseResu
     from aspire.image import Image
     from fast_cryo_pca import FastPCA
     from fle_2d import FLEBasis2D
-    import mrcfile
-    from .moments import centered_ifft2
-    from .preprocessing import RelionParticles, downsample_fourier_images
     from utils_cwf_fast_batch import estimate_radial_psd
 
     started = time.monotonic()
     particles = RelionParticles(
         args.star_path,
         data_folder=args.data_folder,
-        stack_prefix=args.stack_prefix or None,
+        stack_prefix=args.stack_prefix,
         pixel_size=args.native_pixel_size,
     )
-    source_rows = select_rows(particles.n, args.n_images, args.seed)
-    n_images = len(source_rows)
+    n_images = particles.n
+    source_rows = np.arange(n_images, dtype=np.int64)
     source_fingerprint = particles.fingerprint()
     image_names = particles.image_names[source_rows].copy()
     parameters = np.column_stack(
         [particles.column(key)[source_rows] for key in CTF_COLUMNS]
     )
     phase_shifts = particles.column("_rlnPhaseShift", default=0.0)[source_rows]
-    if np.any(phase_shifts != 0):
-        raise ValueError("FastPCA radial CTF does not support nonzero STAR phase shifts")
     (radial_parameters, ctf_ids, order, inverse, starts, counts, exact_mean,
      effective_mean) = group_radial_ctfs(parameters, args.ctf_mean_defocus_bin)
     voxel_size = particles.pixel_size * particles.res / args.denoise_res
@@ -296,15 +356,7 @@ def denoise_relion_particles(config: FastCWFDenoiseConfig) -> FastCWFDenoiseResu
         )
         for row in radial_parameters
     ]
-    sampling = (
-        "all_STAR_rows" if n_images == particles.n
-        else "uniform_without_replacement_then_sort_STAR_rows"
-    )
-    print(
-        f"Selected {n_images:,}/{particles.n:,} particles; sampling={sampling}; "
-        f"seed={args.seed}; canonical ascending STAR rows",
-        flush=True,
-    )
+    print(f"Denoising all {n_images:,} particles of the STAR file", flush=True)
     print(
         f"Native {particles.res}px at {particles.pixel_size:.12g} A/px "
         f"(STAR {particles.metadata_pixel_size:.12g}); denoise {args.denoise_res}px "
@@ -390,8 +442,6 @@ def denoise_relion_particles(config: FastCWFDenoiseConfig) -> FastCWFDenoiseResu
             print(f"Loaded/downsampled/background/PSD {end:,}/{n_images:,}", flush=True)
     noise_psd = noise_psd_sum / n_images
     load_psd_seconds = time.monotonic() - load_psd_started
-    if np.any(background_stds <= 0):
-        raise FloatingPointError("selected-image background noise has zero variance")
 
     n_preview = min(8, n_images)
     preview_input = (-observations[:n_preview] if args.flip_sign
@@ -428,8 +478,6 @@ def denoise_relion_particles(config: FastCWFDenoiseConfig) -> FastCWFDenoiseResu
     denoise_seconds = time.monotonic() - denoise_started
     denoised = np.asarray(denoised_grouped, dtype=np.float32)[inverse]
     contrast_est = np.asarray(contrast_grouped, dtype=np.float64)[inverse]
-    if not np.all(np.isfinite(denoised)) or not np.all(np.isfinite(contrast_est)):
-        raise FloatingPointError("FastPCA returned nonfinite images or contrasts")
 
     write_started = time.monotonic()
     stack_path = output / "denoised_images.mrcs"
@@ -451,10 +499,7 @@ def denoise_relion_particles(config: FastCWFDenoiseConfig) -> FastCWFDenoiseResu
         source_fingerprint=source_fingerprint,
         source_rows=source_rows,
         image_names=image_names,
-        n_total=particles.n,
         n_images=n_images,
-        seed=args.seed,
-        sampling=sampling,
         native_res=particles.res,
         denoise_res=args.denoise_res,
         vox_native=particles.pixel_size,
@@ -503,9 +548,6 @@ def denoise_relion_particles(config: FastCWFDenoiseConfig) -> FastCWFDenoiseResu
         kam_cryoem_commit=git_commit(ROOT),
     )
 
-    import matplotlib.pyplot as plt
-    from .utils import show_particle_image
-
     fig, axes = plt.subplots(2, n_preview, figsize=(2.1 * n_preview, 4.2), squeeze=False)
     for row, images in enumerate((preview_input, denoised[:n_preview])):
         for column, image in enumerate(images):
@@ -527,9 +569,6 @@ def denoise_relion_particles(config: FastCWFDenoiseConfig) -> FastCWFDenoiseResu
         "fle_max_order": int(args.denoise_max_order),
         "fle_n_coefficients": int(np.sum(basis.blk_size)),
         "n_images": n_images,
-        "n_total": particles.n,
-        "seed": args.seed,
-        "sampling": sampling,
         "star_path": str(particles.star_path),
         "data_folder_argument": configured_data_folder,
         "stack_prefix_argument": stack_prefix,
@@ -585,19 +624,575 @@ def denoise_relion_particles(config: FastCWFDenoiseConfig) -> FastCWFDenoiseResu
         f"Manifest: {manifest_path}; elapsed {report['elapsed_seconds']:.1f}s",
         flush=True,
     )
-    return FastCWFDenoiseResult(
-        output_dir=output,
-        stack_path=stack_path,
-        manifest_path=manifest_path,
-        report_path=report_path,
-        n_images=n_images,
-        n_total=particles.n,
-        native_res=particles.res,
-        denoise_res=args.denoise_res,
-        native_pixel_size=particles.pixel_size,
-        denoise_pixel_size=voxel_size,
-        elapsed_seconds=report["elapsed_seconds"],
+
+
+# ===========================================================================
+# Low-crowding particle selection (reference-free: no poses or maps)
+# ===========================================================================
+
+# Fixed crowding score: Gaussian smoothing (pixels of the denoised images), the central disk and the outer annulus (fractions of the image
+# radius), the top fractions of their positive pixels whose RMS is compared, and the number of contrast bins of the stratified allocation.
+SMOOTH_SIGMA = 1.1
+INNER_RADIUS = 0.50
+OUTER_RADIUS = (0.62, 0.94)
+INNER_TOP_FRACTION = 0.20
+OUTER_TOP_FRACTION = 0.10
+CONTRAST_BINS = 4
+DEFAULT_N_SELECT = 10_000
+DEFAULT_NEIGHBOR_FRACTION = 280.0 / 380.0
+
+
+@dataclass(frozen=True)
+class LowCrowdingSelection:
+    """Outputs and diagnostics from :func:`select_low_crowding_particles`.
+
+    Positions index the input image stack.  ``geometry_pass`` records the
+    joint nearest-neighbor and crowding-score gate before stratified sampling.
+    The remaining arrays make the micrograph-by-contrast allocation fully
+    reproducible and auditable.
+    """
+
+    selected_positions: np.ndarray
+    rejected_positions: np.ndarray
+    geometry_pass: np.ndarray
+    crowding_scores: np.ndarray
+    inner_strength: np.ndarray
+    outer_strength: np.ndarray
+    score_ceiling: float
+    contrast_bin_boundaries: np.ndarray
+    contrast_bin_ids: np.ndarray
+    micrograph_ids: np.ndarray
+    stratum_codes: np.ndarray
+    unique_stratum_codes: np.ndarray
+    stratum_population: np.ndarray
+    stratum_geometry_capacity: np.ndarray
+    stratum_selection_quota: np.ndarray
+
+
+def nearest_particle_distances(micrograph_names, coordinate_x, coordinate_y):
+    """Return the nearest distinct pick distance within each micrograph.
+
+    Parameters are one-dimensional arrays in the native particle-table order.
+    Distances are in the same units as the coordinates.  A particle that is
+    alone on its micrograph receives an infinite distance.
+    """
+
+    names = np.asarray(micrograph_names, dtype=str)
+    x = np.asarray(coordinate_x, dtype=np.float64)
+    y = np.asarray(coordinate_y, dtype=np.float64)
+
+    _, group_ids = np.unique(names, return_inverse=True)
+    distances = np.full(len(names), np.inf, dtype=np.float64)
+    for group_id in range(int(group_ids.max()) + 1):
+        rows = np.flatnonzero(group_ids == group_id)
+        if len(rows) < 2:
+            continue
+        coordinates = np.column_stack((x[rows], y[rows]))
+        values, _ = cKDTree(coordinates).query(coordinates, k=2)
+        distances[rows] = values[:, 1]
+    return distances
+
+
+def select_low_crowding_particles(
+        images, micrograph_names, nearest_neighbor_distances, contrast,
+        n_select, *, minimum_neighbor_distance,
+        max_score_quantile=0.95, auto_score_ceiling=False, batch_size=256,
+        progress=None):
+    """Select a low-crowding subset without poses or a reference volume.
+
+    Each image is Gaussian-smoothed, and its crowding score is the top-RMS
+    positive signal in an outer annulus divided by the corresponding signal in
+    a central disk.  Images must pass both a nearest-pick-distance gate and a
+    global score-quantile gate.  Among passing images, the requested count is
+    allocated proportionally across micrograph-by-contrast-bin strata, subject
+    to the capacity of each stratum, and the lowest scores are retained.
+
+    ``images`` may be an in-memory array or an array-like memory map with shape
+    ``(n, side, side)``.  ``nearest_neighbor_distances`` should normally be
+    computed from the complete particle table with
+    :func:`nearest_particle_distances` and then indexed into the image-stack
+    order.  ``progress``, when supplied, is called as ``progress(done, total)``
+    after periodic scoring batches.
+
+    ``auto_score_ceiling=True`` ignores ``max_score_quantile`` and uses the
+    tightest score ceiling that still leaves ``n_select`` neighbor-gate
+    candidates, i.e. the ``n_select``-th smallest score among them.  When fewer
+    images pass the gates than ``n_select``, all passing images are selected.
+
+    The selection is deterministic: ties are resolved by input position and
+    returned positions are sorted.  No random sampling is performed here.
+    """
+
+    count, side, _ = map(int, images.shape)
+    names = np.asarray(micrograph_names, dtype=str)
+    distances = np.asarray(nearest_neighbor_distances, dtype=np.float64)
+    contrast = np.asarray(contrast, dtype=np.float64)
+    n_select, contrast_bins, batch_size = int(n_select), CONTRAST_BINS, int(batch_size)
+
+    coordinates = np.arange(side, dtype=np.float64) - (side - 1) / 2
+    yy, xx = np.meshgrid(coordinates, coordinates, indexing="ij")
+    radius = np.sqrt(xx ** 2 + yy ** 2) / (side / 2)
+    inner_mask = radius <= INNER_RADIUS
+    outer_mask = (radius >= OUTER_RADIUS[0]) & (radius <= OUTER_RADIUS[1])
+
+    scores = np.empty(count, dtype=np.float64)
+    inner_strength = np.empty(count, dtype=np.float64)
+    outer_strength = np.empty(count, dtype=np.float64)
+    for start in range(0, count, batch_size):
+        end = min(start + batch_size, count)
+        batch = np.array(images[start:end], dtype=np.float32, copy=True)
+        smooth = gaussian_filter(
+            batch, sigma=(0, SMOOTH_SIGMA, SMOOTH_SIGMA), mode="nearest")
+        positive = np.maximum(smooth, 0.0)
+        central = _top_rms(positive[:, inner_mask], INNER_TOP_FRACTION)
+        peripheral = _top_rms(positive[:, outer_mask], OUTER_TOP_FRACTION)
+        floor = max(float(np.median(central)) * 1e-6,
+                    np.finfo(np.float32).tiny)
+        scores[start:end] = peripheral / np.maximum(central, floor)
+        inner_strength[start:end] = central
+        outer_strength[start:end] = peripheral
+        if progress is not None and (end == count or end % (10 * batch_size) == 0):
+            progress(end, count)
+
+    if auto_score_ceiling:
+        candidates = np.sort(scores[distances >= minimum_neighbor_distance])
+        n_select = min(n_select, len(candidates))
+        score_ceiling = float(candidates[n_select - 1])
+    else:
+        score_ceiling = float(np.quantile(scores, max_score_quantile))
+    geometry_pass = ((distances >= minimum_neighbor_distance)
+                     & (scores <= score_ceiling))
+    n_select = min(n_select, int(geometry_pass.sum()))
+
+    boundaries = np.quantile(
+        contrast, np.arange(1, contrast_bins) / contrast_bins)
+    contrast_ids = np.searchsorted(boundaries, contrast, side="right")
+    _, micrograph_ids = np.unique(names, return_inverse=True)
+    stratum_codes = micrograph_ids * contrast_bins + contrast_ids
+    unique_strata, inverse_strata = np.unique(stratum_codes, return_inverse=True)
+    population = np.bincount(inverse_strata)
+    capacity = np.bincount(
+        inverse_strata[geometry_pass], minlength=len(unique_strata))
+    quotas = _capped_proportional_quotas(population, capacity, n_select)
+
+    selected_parts = []
+    for stratum, quota in enumerate(quotas):
+        if quota == 0:
+            continue
+        candidates = np.flatnonzero(geometry_pass & (inverse_strata == stratum))
+        rank = np.lexsort((candidates, scores[candidates]))
+        selected_parts.append(candidates[rank[:quota]])
+    selected_positions = np.sort(np.concatenate(selected_parts))
+    selected_mask = np.zeros(count, dtype=bool)
+    selected_mask[selected_positions] = True
+
+    return LowCrowdingSelection(
+        selected_positions=selected_positions,
+        rejected_positions=np.flatnonzero(~selected_mask),
+        geometry_pass=geometry_pass,
+        crowding_scores=scores,
+        inner_strength=inner_strength,
+        outer_strength=outer_strength,
+        score_ceiling=score_ceiling,
+        contrast_bin_boundaries=boundaries,
+        contrast_bin_ids=contrast_ids,
+        micrograph_ids=micrograph_ids,
+        stratum_codes=stratum_codes,
+        unique_stratum_codes=unique_strata,
+        stratum_population=population,
+        stratum_geometry_capacity=capacity,
+        stratum_selection_quota=quotas,
     )
+
+
+def _top_rms(values, fraction):
+    count = max(1, int(np.ceil(fraction * values.shape[1])))
+    partitioned = np.partition(values, values.shape[1] - count, axis=1)
+    return np.sqrt(np.mean(partitioned[:, -count:] ** 2, axis=1))
+
+
+def _capped_proportional_quotas(population, capacity, total):
+    """Allocate proportional integer quotas subject to stratum capacities."""
+
+    population = np.asarray(population, dtype=np.int64)
+    capacity = np.asarray(capacity, dtype=np.int64)
+    if total == 0:
+        return np.zeros_like(population)
+    lower, upper = 0.0, max(1.0, total / max(int(population.sum()), 1))
+    while np.minimum(capacity, upper * population).sum() < total:
+        upper *= 2
+    for _ in range(80):
+        middle = (lower + upper) / 2
+        if np.minimum(capacity, middle * population).sum() < total:
+            lower = middle
+        else:
+            upper = middle
+    desired = np.minimum(capacity, upper * population)
+    quotas = np.floor(desired).astype(np.int64)
+    remaining = total - int(quotas.sum())
+    if remaining:
+        eligible = np.flatnonzero(quotas < capacity)
+        priority = desired[eligible] - quotas[eligible]
+        order = eligible[np.lexsort((eligible, -priority))]
+        quotas[order[:remaining]] += 1
+    return quotas
+
+
+
+def scalar(manifest, name):
+    """One scalar of an NPZ manifest."""
+    return np.asarray(manifest[name]).reshape(()).item()
+
+
+def optional_text(manifest, name):
+    """An optional path or prefix of a denoising manifest, which stores None as an empty string."""
+    return str(scalar(manifest, name)) or None
+
+
+def save_selection_diagnostic(images, selected, path, scores=None):
+    """Save a random audit montage with a check or cross beside each image."""
+    images = np.asarray(images)
+    selected = np.asarray(selected, dtype=bool)
+    if scores is not None:
+        scores = np.asarray(scores, dtype=float)
+
+    columns = int(np.ceil(np.sqrt(len(images))))
+    rows = int(np.ceil(len(images) / columns))
+    figure = plt.figure(figsize=(1.45 * columns, 1.25 * rows))
+    outer = figure.add_gridspec(
+        rows, columns, left=0.005, right=0.995, bottom=0.005, top=0.995,
+        wspace=0.08, hspace=0.08)
+    for position in range(rows * columns):
+        row, column = divmod(position, columns)
+        if position >= len(images):
+            axis = figure.add_subplot(outer[row, column])
+            axis.set_axis_off()
+            continue
+        inner = outer[row, column].subgridspec(
+            1, 2, width_ratios=(5.0, 1.0), wspace=0.02)
+        image_axis = figure.add_subplot(inner[0, 0])
+        mark_axis = figure.add_subplot(inner[0, 1])
+        image = images[position]
+        color = "#16883b" if selected[position] else "#c62828"
+        show_particle_image(image_axis, image)
+        image_axis.add_patch(Rectangle(
+            (-0.5, -0.5), image.shape[1], image.shape[0], fill=False,
+            edgecolor=color, linewidth=1.8))
+        image_axis.set_axis_off()
+        if scores is not None:
+            image_axis.text(
+                0.03, 0.03, f"{scores[position]:.3f}",
+                transform=image_axis.transAxes, fontsize=7, color="white",
+                bbox={"facecolor": "black", "alpha": 0.6, "edgecolor": "none",
+                      "pad": 1})
+        mark_axis.set_xlim(0.0, 1.0)
+        mark_axis.set_ylim(0.0, 1.0)
+        mark_axis.set_aspect("equal")
+        mark_axis.set_axis_off()
+        if selected[position]:
+            mark_axis.plot(
+                (0.10, 0.38, 0.90), (0.50, 0.20, 0.82), color=color,
+                linewidth=3.2, solid_capstyle="round", solid_joinstyle="round")
+        else:
+            mark_axis.plot(
+                (0.16, 0.84), (0.16, 0.84), color=color, linewidth=3.2,
+                solid_capstyle="round")
+            mark_axis.plot(
+                (0.16, 0.84), (0.84, 0.16), color=color, linewidth=3.2,
+                solid_capstyle="round")
+    figure.savefig(path.with_suffix(".pdf"), bbox_inches="tight", pad_inches=0)
+    plt.close(figure)
+
+
+SELECTION_OUTPUT_NAMES = (
+    "selection.npz", "selection_report.json", "selected_particles.tsv",
+    "selection_diagnostic.pdf", "selection_scores.pdf",
+    "selection_selected_sample.pdf",
+)
+
+
+def _require_selection_outputs_absent(output: Path) -> None:
+    """Allow denoising files here without overwriting a previous selection."""
+    existing = [name for name in SELECTION_OUTPUT_NAMES
+                if (output / name).exists()]
+    if existing:
+        raise FileExistsError(
+            f"selection output already exists in {output}: {', '.join(existing)}")
+
+
+def save_selected_sample(images, scores, path, columns=20):
+    """Save a montage of selected particles with the crowding score in the corner."""
+    images = np.asarray(images)
+    rows = int(np.ceil(len(images) / columns))
+    figure, axes = plt.subplots(
+        rows, columns, figsize=(1.5 * columns, 1.5 * rows + 0.4), squeeze=False)
+    for axis in axes.ravel():
+        axis.set_axis_off()
+    for axis, image, score in zip(axes.ravel(), images, scores):
+        show_particle_image(axis, image)
+        axis.text(0.03, 0.03, f"{score:.2f}", transform=axis.transAxes,
+                  fontsize=6, color="white",
+                  bbox={"facecolor": "black", "alpha": 0.6,
+                        "edgecolor": "none", "pad": 1})
+    figure.suptitle(f"{len(images)} random selected particles "
+                    "(corner: crowding score)", y=0.998)
+    figure.subplots_adjust(0.003, 0.003, 0.997, 0.97, 0.03, 0.03)
+    figure.savefig(path.with_suffix(".pdf"), dpi=100)
+    plt.close(figure)
+
+
+def save_selection_scores(scores, selected, score_ceiling, path):
+    """Compare selected and rejected image scores using the same histogram bins."""
+    scores = np.asarray(scores, dtype=float)
+    selected = np.asarray(selected, dtype=bool)
+    edges = np.histogram_bin_edges(scores, bins=60)
+    figure, axis = plt.subplots(figsize=(6.0, 4.0))
+    axis.hist([scores[selected], scores[~selected]], bins=edges, stacked=True,
+              color=["#16883b", "#bdbdbd"], label=["Selected", "Not selected"])
+    if np.isfinite(score_ceiling):
+        axis.axvline(score_ceiling, color="#c62828", linestyle="--",
+                     linewidth=1.0, label="Score ceiling")
+    axis.set(xlabel="Crowding score (outer / central signal)", ylabel="Images")
+    axis.legend(frameon=False)
+    figure.tight_layout()
+    figure.savefig(path.with_suffix(".pdf"))
+    plt.close(figure)
+
+
+def manifest_geometry(manifest, manifest_path):
+    """The denoised stack of a denoising manifest with its image count, native and denoised side and native pixel size."""
+    stack_path = Path(str(scalar(manifest, "denoised_stack")))
+    return (stack_path, int(scalar(manifest, "n_images")), int(scalar(manifest, "native_res")),
+            int(scalar(manifest, "denoise_res")), float(scalar(manifest, "vox_native")))
+
+
+def select_particles(*, denoising_dir, output_dir, n_select, n_preview, seed, neighbor_distance_fraction, max_score_quantile,
+                     auto_score_quantile, batch_size):
+    """Select the least crowded particles of a denoising output and write ``selection.npz``, ``selection_report.json``,
+    ``selected_particles.tsv`` and the diagnostic plots to ``output_dir`` (which may be the denoising directory itself).
+
+    ``auto_score_quantile`` takes the tightest crowding-score ceiling that leaves ``n_select`` particles; otherwise the ceiling is the
+    ``max_score_quantile`` quantile of the scores."""
+    started = time.monotonic()
+    output = Path(output_dir).resolve()
+    denoising = Path(denoising_dir).resolve(strict=True)
+    _require_selection_outputs_absent(output)
+    output.mkdir(parents=True, exist_ok=True)
+
+    manifest_path = (denoising / "manifest.npz").resolve(strict=True)
+    with np.load(manifest_path, allow_pickle=False) as saved:
+        manifest = {name: saved[name] for name in saved.files}
+    stack_path, count, native_res, side, vox_native = manifest_geometry(manifest, manifest_path)
+    input_loading_done = time.monotonic()
+
+    source_rows = np.asarray(manifest["source_rows"], dtype=np.int64)
+    image_names = np.asarray(manifest["image_names"], dtype=str)
+
+    star_path = Path(str(scalar(manifest, "star_path")))
+    data_folder = optional_text(manifest, "data_folder")
+    stack_prefix = optional_text(manifest, "stack_prefix")
+    particles = RelionParticles(
+        star_path, data_folder=data_folder, stack_prefix=stack_prefix,
+        pixel_size=vox_native)
+    micrograph_names = np.asarray(
+        particles.metadata["_rlnMicrographName"], dtype=str)
+    # The pick coordinates are in micrograph pixels: their size is the optics column _rlnMicrographPixelSize (written for
+    # Fourier-cropped particle stacks), otherwise the particle pixel size. The threshold is the fraction of the field of view.
+    coordinate_pixel = float(particles.column("_rlnMicrographPixelSize", vox_native)[0])
+    neighbor_distance = neighbor_distance_fraction * native_res * vox_native / coordinate_pixel
+    all_neighbor_distances = nearest_particle_distances(
+        micrograph_names, particles.column("_rlnCoordinateX"),
+        particles.column("_rlnCoordinateY"))
+    neighbor_distances = all_neighbor_distances[source_rows]
+    contrast = np.asarray(manifest["contrast_est"], dtype=np.float64)
+    metadata_setup_done = time.monotonic()
+    with mrcfile.mmap(stack_path, mode="r", permissive=False) as stack:
+        selection = select_low_crowding_particles(
+            stack.data, micrograph_names[source_rows], neighbor_distances,
+            contrast, n_select,
+            minimum_neighbor_distance=neighbor_distance,
+            max_score_quantile=max_score_quantile,
+            auto_score_ceiling=auto_score_quantile,
+            batch_size=batch_size,
+            progress=lambda done, total: print(
+                f"  scored {done:,}/{total:,}", flush=True))
+
+    selected_positions = selection.selected_positions
+    rejected_positions = selection.rejected_positions
+    geometry_pass = selection.geometry_pass
+    scores = selection.crowding_scores
+    inner_strength = selection.inner_strength
+    outer_strength = selection.outer_strength
+    score_ceiling = selection.score_ceiling
+    boundaries = selection.contrast_bin_boundaries
+    contrast_ids = selection.contrast_bin_ids
+    micrograph_ids = selection.micrograph_ids
+    stratum_codes = selection.stratum_codes
+    unique_strata = selection.unique_stratum_codes
+    population = selection.stratum_population
+    capacity = selection.stratum_geometry_capacity
+    quotas = selection.stratum_selection_quota
+    selected_mask = np.zeros(count, dtype=bool)
+    selected_mask[selected_positions] = True
+    selection_done = time.monotonic()
+
+    diagnostic_rng = np.random.default_rng(
+        np.random.SeedSequence([seed, 0x53454C]))
+    diagnostic_positions = diagnostic_rng.choice(
+        count, n_preview, replace=False)
+    diagnostic_selected = selected_mask[diagnostic_positions]
+    with mrcfile.mmap(stack_path, mode="r", permissive=False) as stack:
+        diagnostic_images = np.array(
+            stack.data[diagnostic_positions], dtype=np.float32, copy=True)
+    save_selection_diagnostic(
+        diagnostic_images, diagnostic_selected,
+        output / "selection_diagnostic", scores=scores[diagnostic_positions])
+    save_selection_scores(
+        scores, selected_mask, score_ceiling, output / "selection_scores")
+    sample_positions = np.sort(np.random.default_rng(
+        np.random.SeedSequence([seed, 0x53414D])).choice(
+            selected_positions, min(200, len(selected_positions)), replace=False))
+    with mrcfile.mmap(stack_path, mode="r", permissive=False) as stack:
+        sample_images = np.array(
+            stack.data[sample_positions], dtype=np.float32, copy=True)
+    save_selected_sample(
+        sample_images, scores[sample_positions], output / "selection_selected_sample")
+    diagnostic_pdf = output / "selection_diagnostic.pdf"
+
+    dataset = optional_text(manifest, "dataset")
+    source_fingerprint = optional_text(manifest, "source_fingerprint")
+    manifest_hash = sha256_file(manifest_path)
+    np.savez_compressed(
+        output / "selection.npz",
+        selected_positions=selected_positions,
+        selected_source_rows=source_rows[selected_positions],
+        selected_image_names=image_names[selected_positions],
+        rejected_positions=rejected_positions,
+        geometry_pass_positions=np.flatnonzero(geometry_pass),
+        diagnostic_positions=diagnostic_positions,
+        diagnostic_selected=diagnostic_selected,
+        crowding_scores=scores,
+        inner_strength=inner_strength,
+        outer_strength=outer_strength,
+        nearest_neighbor_distance_coordinate_pixels=neighbor_distances,
+        contrast_bin_boundaries=boundaries,
+        contrast_bin_ids=contrast_ids,
+        stratum_codes=stratum_codes,
+        unique_stratum_codes=unique_strata,
+        stratum_population=population,
+        stratum_geometry_capacity=capacity,
+        stratum_selection_quota=quotas,
+        effective_contrast_bins=len(np.unique(contrast_ids)),
+        dataset="" if dataset is None else dataset,
+        source_fingerprint="" if source_fingerprint is None else source_fingerprint,
+        input_manifest=str(manifest_path),
+        input_manifest_sha256=manifest_hash,
+        input_stack=str(stack_path),
+        native_res=native_res,
+        native_pixel_size_angstrom=vox_native,
+        minimum_neighbor_distance_fraction=neighbor_distance_fraction,
+        coordinate_pixel_size_angstrom=coordinate_pixel,
+        minimum_neighbor_distance_coordinate_pixels=neighbor_distance,
+    )
+    with (output / "selected_particles.tsv").open("w") as stream:
+        stream.write(
+            "denoised_position\tstar_row_zero_based\timage_name\t"
+            "crowding_score\tnearest_neighbor_coordinate_pixels\n")
+        for position in selected_positions:
+            stream.write(
+                f"{position}\t{source_rows[position]}\t{image_names[position]}\t"
+                f"{scores[position]:.9g}\t{neighbor_distances[position]:.9g}\n")
+
+    selection_path = output / "selection.npz"
+    before_report_write = time.monotonic()
+    timings = {
+        "input_and_manifest_loading": input_loading_done - started,
+        "metadata_and_neighbor_setup": (
+            metadata_setup_done - input_loading_done),
+        "scoring_and_selection": selection_done - metadata_setup_done,
+        "diagnostic_and_output_writing": before_report_write - selection_done,
+    }
+    report = {
+        "dataset": dataset,
+        "input_stack": str(stack_path),
+        "input_manifest": str(manifest_path),
+        "input_manifest_sha256": manifest_hash,
+        "selection_sha256": sha256_file(selection_path),
+        "source_fingerprint": source_fingerprint,
+        "source_star": str(star_path),
+        "source_data_folder": None if data_folder is None else str(data_folder),
+        "source_stack_prefix": stack_prefix,
+        "n_input": count,
+        "n_requested": n_select,
+        "n_selected": int(len(selection.selected_positions)),
+        "selected_fraction": len(selection.selected_positions) / count,
+        "native_box_pixels": native_res,
+        "native_pixel_size_angstrom": vox_native,
+        "native_box_size_angstrom": native_res * vox_native,
+        "smooth_sigma_pixels_at_denoise_resolution": SMOOTH_SIGMA,
+        "minimum_neighbor_distance_fraction_of_native_box": neighbor_distance_fraction,
+        "coordinate_pixel_size_angstrom": coordinate_pixel,
+        "minimum_neighbor_distance_coordinate_pixels": neighbor_distance,
+        "score_quantile_mode": "auto" if auto_score_quantile else "fixed",
+        "maximum_crowding_score_quantile": (
+            float(np.mean(scores <= score_ceiling)) if auto_score_quantile
+            else max_score_quantile),
+        "maximum_crowding_score": score_ceiling,
+        "n_passing_geometry_and_score_gates": int(geometry_pass.sum()),
+        "n_micrographs": int(len(np.unique(micrograph_ids))),
+        "n_populated_micrograph_contrast_strata": int(len(unique_strata)),
+        "contrast_bins": CONTRAST_BINS,
+        "effective_contrast_bins": int(len(np.unique(contrast_ids))),
+        "contrast_bin_boundaries": boundaries.tolist(),
+        "inner_radius_fraction": INNER_RADIUS,
+        "outer_radius_fraction": list(OUTER_RADIUS),
+        "inner_top_fraction": INNER_TOP_FRACTION,
+        "outer_top_fraction": OUTER_TOP_FRACTION,
+        "selected_score_quantiles": {
+            str(q): float(np.quantile(scores[selected_positions], q))
+            for q in (0, 0.1, 0.5, 0.9, 0.99, 1)},
+        "score_quantiles": {
+            str(q): float(np.quantile(scores, q))
+            for q in (0, 0.01, 0.1, 0.2, 0.5, 0.8, 0.9, 0.99, 1)},
+        "preview_seed": seed,
+        "n_preview": n_preview,
+        "selection_diagnostic": {
+            "seed_sequence": [seed, 0x53454C],
+            "n_images": int(len(diagnostic_positions)),
+            "n_selected": int(np.sum(diagnostic_selected)),
+            "n_not_selected": int(np.sum(~diagnostic_selected)),
+            "pdf": str(diagnostic_pdf),
+            "pdf_sha256": sha256_file(diagnostic_pdf),
+        },
+        "score_plot": {
+            "pdf": str(output / "selection_scores.pdf"),
+        },
+        "elapsed_seconds": before_report_write - started,
+        "timings_seconds": timings,
+        "provenance": {
+            "kam_cryoem_commit": git_commit(ROOT),
+            "python": sys.version,
+            "numpy": np.__version__,
+        },
+    }
+    report_path = output / "selection_report.json"
+    # Write once so the measured output stage includes a real JSON
+    # serialization and filesystem write, then patch in the final timings.
+    report_path.write_text(json.dumps(report, indent=2) + "\n")
+    report_checkpoint = time.monotonic()
+    timings["diagnostic_and_output_writing"] = (
+        report_checkpoint - selection_done)
+    report["elapsed_seconds"] = report_checkpoint - started
+    report_path.write_text(json.dumps(report, indent=2) + "\n")
+    print(
+        "Selection timing: "
+        f"input={timings['input_and_manifest_loading']:.1f}s, "
+        f"metadata={timings['metadata_and_neighbor_setup']:.1f}s, "
+        f"scoring={timings['scoring_and_selection']:.1f}s, "
+        f"outputs={timings['diagnostic_and_output_writing']:.1f}s, "
+        f"total={report['elapsed_seconds']:.1f}s",
+        flush=True)
+    print(json.dumps(report, indent=2), flush=True)
 
 
 # ===========================================================================
