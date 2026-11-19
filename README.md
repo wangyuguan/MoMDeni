@@ -1,4 +1,4 @@
-# MMDI
+# MoMDeni
 
 Method-of-moments ab initio modeling for cryo-EM from denoised particle images. `kam` denoises the particles, keeps the least crowded
 ones and fits a low-resolution map to their first three Fourier-Bessel moments (M1, M2, M3), for example to initialize a refinement.
@@ -6,10 +6,10 @@ ones and fits a low-resolution map to their first three Fourier-Bessel moments (
 ## Installation
 
 ```bash
-git clone --recursive https://github.com/wangyuguan/MMDI.git
-cd MMDI
-conda create --name mmdi python=3.9 pip
-conda activate mmdi
+git clone --recursive https://github.com/wangyuguan/MoMDeni.git
+cd MoMDeni
+conda create --name momdeni python=3.9 pip
+conda activate momdeni
 pip install -e .            # CPU
 pip install -e ".[gpu]"     # CUDA 12 GPUs (CuPy, cuFINUFFT); PyTorch must be a CUDA build
 ```
