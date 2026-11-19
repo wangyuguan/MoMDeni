@@ -14,7 +14,7 @@ pip install -e .            # CPU
 pip install -e ".[gpu]"     # CUDA 12 GPUs (CuPy, cuFINUFFT); PyTorch must be a CUDA build
 ```
 
-Denoising uses the submodules `fle_2d` and `fast-cryoEM-PCA`, so clone with `--recursive` and install in editable mode.
+We use the submodules `fle_2d` and `fast-cryoEM-PCA` to denoise images, so clone with `--recursive` and install in editable mode.
 
 ## Example
 
@@ -52,5 +52,5 @@ Main options (`kam <command> --help` lists all):
 
 ## Acknowledgements
 
-Denoising uses [fle_2d](https://github.com/nmarshallf/fle_2d), [fast-cryoEM-PCA](https://github.com/yunpeng-shi/fast-cryoEM-PCA) and
+Our implementation depends on [fle_2d](https://github.com/nmarshallf/fle_2d), [fast-cryoEM-PCA](https://github.com/yunpeng-shi/fast-cryoEM-PCA) and
 [ASPIRE](https://github.com/ComputationalCryoEM/ASPIRE-Python).
