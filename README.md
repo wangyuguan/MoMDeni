@@ -39,7 +39,7 @@ solution whose model best explains M3 and fits M3 from it; the map is `out/M3/re
 
 `kam pipeline` takes a RELION particle STAR file with CTF parameters, pick coordinates and micrograph names. It denoises the particles
 at 64 x 64 pixels (FastPCA, covariance Wiener filtering), keeps the 10,000 least crowded ones (`--n-select`), denoises them again and
-fits their moments as `kam reconstruct` does. The map is `results/<EMPIAR number>_<job id>/kam_pipeline/MoM/M3/recon.mrc`.
+fits their moments as `kam reconstruct` does. The map will be `results/<EMPIAR number>_<job id>/kam_pipeline/MoM/M3/recon.mrc`.
 
 Main options (`kam <command> --help` lists all):
 
