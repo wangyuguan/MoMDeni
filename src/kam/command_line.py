@@ -104,6 +104,7 @@ def _configuration(args: argparse.Namespace) -> dict:
             "ctf_mean_defocus_bin_angstrom": args.ctf_mean_defocus_bin,
             "background_radius": args.background_radius,
             "flip_sign": args.flip_sign,
+            "whiten_per_micrograph": args.whiten_per_micrograph,
         },
         "selection": {
             "n_images": args.n_select,
@@ -140,8 +141,11 @@ def _denoise_command(args, paths):
         "--denoise-max-order", str(args.denoise_max_order),
         "--ctf-mean-defocus-bin", str(args.ctf_mean_defocus_bin),
         "--flip-sign" if args.flip_sign else "--no-flip-sign",
+        "--whiten-per-micrograph" if args.whiten_per_micrograph else "--no-whiten-per-micrograph",
         "--outdir", str(paths["denoising"]),
     ]
+    if args.micrograph_noise_psd is not None:
+        command.extend(["--micrograph-noise-psd", str(args.micrograph_noise_psd)])
     if args.data_folder is not None:
         command.extend(["--datadir", str(args.data_folder.expanduser().resolve())])
     if args.stack_prefix is not None:
@@ -370,6 +374,8 @@ def _second_pass(args: argparse.Namespace, paths: dict[str, Path]):
     folder = paths["redenoised"]
     second = copy.copy(args)
     second.star_path = folder.parent / "selected_particles.star"
+    # per-micrograph whitening reuses the spectra of the first pass, which has all particles of each micrograph
+    second.micrograph_noise_psd = paths["denoising"] / "manifest.npz" if args.whiten_per_micrograph else None
     if args.data_folder is None:          # relative stack paths are relative to the STAR of the first pass
         second.data_folder = args.star_path.expanduser().resolve().parent
     second_paths = dict(paths, denoising=folder, selection=folder)
@@ -627,6 +633,10 @@ def _pipeline_parser() -> argparse.ArgumentParser:
     parser.add_argument("--flip-sign", action=argparse.BooleanOptionalAction,
                         default=True)
     parser.add_argument(
+        "--whiten-per-micrograph", action=argparse.BooleanOptionalAction, default=False,
+        help="whiten every image with the noise spectrum of its micrograph instead of one spectrum for the whole dataset")
+    parser.set_defaults(micrograph_noise_psd=None)
+    parser.add_argument(
         "--neighbor-distance-fraction", type=float, default=DEFAULT_NEIGHBOR_FRACTION,
         help="minimum pick separation as a fraction of the box (field of view) of the particle images")
     parser.add_argument("--n-preview", type=int, default=100)
@@ -773,6 +783,12 @@ def _denoise_parse_args(argv=None):
         default=True,
         help="Flip raw-image sign inside FastPCA (default: enabled)",
     )
+    parser.add_argument(
+        "--whiten-per-micrograph", action=argparse.BooleanOptionalAction, default=False,
+        help="whiten every image with the noise spectrum of its micrograph instead of one spectrum for the whole dataset")
+    parser.add_argument(
+        "--micrograph-noise-psd", type=Path,
+        help="manifest.npz of an earlier denoising whose per-micrograph noise spectra are used (they are estimated otherwise)")
     return parser.parse_args(argv)
 
 

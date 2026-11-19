@@ -161,15 +161,18 @@ class FastCWFDenoiseConfig:
     denoise_max_order: int = DEFAULT_DENOISE_MAX_ORDER
     ctf_mean_defocus_bin: float = 50.0
     flip_sign: bool = True
+    whiten_per_micrograph: bool = False
+    micrograph_noise_psd: Path | None = None
 
 
-def group_radial_ctfs(parameters, mean_defocus_bin):
+def group_radial_ctfs(parameters, mean_defocus_bin, labels=None):
     """Group radial CTFs and return an internal contiguous ordering.
 
     Groups retain exact voltage, spherical aberration, and amplitude contrast.
     They ignore astigmatism orientation and replace ``(U,V)`` by mean defocus.
     A positive bin width rounds mean defocus to its nearest bin center; zero
-    retains the exact per-particle mean.
+    retains the exact per-particle mean. ``labels`` (one integer per particle,
+    its micrograph for per-micrograph whitening) splits the groups further.
     """
     parameters = np.asarray(parameters, dtype=np.float64)
 
@@ -180,13 +183,15 @@ def group_radial_ctfs(parameters, mean_defocus_bin):
         effective_mean = mean_defocus_bin * np.rint(exact_mean / mean_defocus_bin)
     keys = np.column_stack((parameters[:, 0], parameters[:, 4],
                             parameters[:, 5], effective_mean))
+    if labels is not None:
+        keys = np.column_stack((keys, labels))
     unique, ids, counts = np.unique(
         keys, axis=0, return_inverse=True, return_counts=True
     )
     order = np.argsort(ids, kind="stable")
     inverse = np.argsort(order)
     starts = np.r_[0, np.cumsum(counts)[:-1]].astype(np.int64)
-    return unique, ids.astype(np.int64), order, inverse, starts, counts, exact_mean, effective_mean
+    return unique[:, :4], ids.astype(np.int64), order, inverse, starts, counts, exact_mean, effective_mean
 
 
 def ctf_phase_error_bounds(parameters, effective_mean, pixel_size):
@@ -249,7 +254,8 @@ def denoise_fastpca_batches(fast_pca, mean_est, covar_est, batch_size):
     filter_ids = np.asarray(source.filter_indices, dtype=np.int64)
     whiten_radial = 1.0 / np.sqrt(fast_pca.noise_psd)
     whiten_eigen = basis.expand_radial_vec(whiten_radial)
-    whiten = basis.to_angular_order(whiten_eigen.T).T
+    whiten = basis.to_angular_order(whiten_eigen.T).T          # one row, or one row per filter group (per-micrograph whitening)
+    per_group = whiten.shape[0] > 1
     filters = source.unique_filters
     block_zero = slice(basis.blk_ind[0], basis.blk_ind[1])
     coefficient_one = basis.to_angular_order(
@@ -282,8 +288,8 @@ def denoise_fastpca_batches(fast_pca, mean_est, covar_est, batch_size):
             voltage, spherical_aberration, amplitude_contrast, defocus,
             fast_pca.pixel_size)
         transfer = basis.to_angular_order(transfer.T).T
-        coefficients *= whiten
-        transfer *= whiten
+        coefficients *= whiten[batch_filter_ids] if per_group else whiten
+        transfer *= whiten[unique_ids] if per_group else whiten
 
         wiener_started = time.monotonic()
         estimated = wiener_filter(
@@ -340,8 +346,11 @@ def denoise_relion_particles(config: FastCWFDenoiseConfig):
         [particles.column(key)[source_rows] for key in CTF_COLUMNS]
     )
     phase_shifts = particles.column("_rlnPhaseShift", default=0.0)[source_rows]
+    micrograph_names, micrograph_ids = np.unique(
+        np.asarray(particles.metadata["_rlnMicrographName"], dtype=str)[source_rows], return_inverse=True)
     (radial_parameters, ctf_ids, order, inverse, starts, counts, exact_mean,
-     effective_mean) = group_radial_ctfs(parameters, args.ctf_mean_defocus_bin)
+     effective_mean) = group_radial_ctfs(parameters, args.ctf_mean_defocus_bin,
+                                         labels=micrograph_ids if args.whiten_per_micrograph else None)
     voxel_size = particles.pixel_size * particles.res / args.denoise_res
     astigmatism, astig_bound, quantization_bound = ctf_phase_error_bounds(
         parameters, effective_mean, voxel_size
@@ -417,6 +426,7 @@ def denoise_relion_particles(config: FastCWFDenoiseConfig):
     background_means = np.empty(n_images, dtype=np.float64)
     background_stds = np.empty(n_images, dtype=np.float64)
     noise_psd_sum = np.zeros(basis.pts.shape[0], dtype=np.float64)
+    micrograph_psd_sum = np.zeros((len(micrograph_names), basis.pts.shape[0]), dtype=np.float64)
     load_psd_started = time.monotonic()
 
     def load_chunk(positions):
@@ -438,9 +448,21 @@ def denoise_relion_particles(config: FastCWFDenoiseConfig):
             observations[start:end] = images
             background_means[start:end] = means
             background_stds[start:end] = stds
-            noise_psd_sum += np.sum(psd_estimator(observations[start:end]), axis=0, dtype=np.float64)
+            psd = psd_estimator(observations[start:end])
+            noise_psd_sum += np.sum(psd, axis=0, dtype=np.float64)
+            np.add.at(micrograph_psd_sum, micrograph_ids[start:end], psd)
             print(f"Loaded/downsampled/background/PSD {end:,}/{n_images:,}", flush=True)
     noise_psd = noise_psd_sum / n_images
+    micrograph_noise_psd = micrograph_psd_sum / np.bincount(micrograph_ids)[:, None]
+    if args.micrograph_noise_psd is not None:      # the spectra of an earlier denoising of more particles of the same micrographs
+        with np.load(args.micrograph_noise_psd, allow_pickle=False) as reference:
+            rows = {name: k for k, name in enumerate(np.asarray(reference["micrograph_names"], dtype=str))}
+            micrograph_noise_psd = np.asarray(reference["micrograph_noise_psd"])[[rows[name] for name in micrograph_names]]
+    group_noise_psd = micrograph_noise_psd[micrograph_ids[order][starts]]      # every filter group lies on one micrograph
+    print("Whitening: " + (f"one noise spectrum per micrograph ({len(micrograph_names):,} micrographs, "
+                           f"{len(radial_parameters):,} CTF x micrograph groups, spectra from "
+                           f"{args.micrograph_noise_psd or 'these particles'})" if args.whiten_per_micrograph
+                           else "one noise spectrum for the whole dataset"), flush=True)
     load_psd_seconds = time.monotonic() - load_psd_started
 
     n_preview = min(8, n_images)
@@ -456,12 +478,12 @@ def denoise_relion_particles(config: FastCWFDenoiseConfig):
     del observations
     options = {
         "whiten": True,
-        "noise_psd": noise_psd,
+        "noise_psd": group_noise_psd if args.whiten_per_micrograph else noise_psd,
         "store_noise_psd": True,
         "radius": args.background_radius,
         "batch_size": args.batch_size,
         "single_pass": True,
-        "single_whiten_filter": True,
+        "single_whiten_filter": not args.whiten_per_micrograph,
         "flip_sign": args.flip_sign,
         "correct_contrast": True,
         "subtract_background": False,
@@ -529,6 +551,9 @@ def denoise_relion_particles(config: FastCWFDenoiseConfig):
         combined_phase_error_bound_at_denoise_nyquist=astig_bound + quantization_bound,
         noise_psd=noise_psd,
         noise_psd_sampling_points=basis.pts,
+        whiten_per_micrograph=args.whiten_per_micrograph,
+        micrograph_names=micrograph_names,
+        micrograph_noise_psd=micrograph_noise_psd,
         flip_sign=args.flip_sign,
         background_radius=args.background_radius,
         background_means=background_means,
@@ -597,6 +622,8 @@ def denoise_relion_particles(config: FastCWFDenoiseConfig):
             np.max(astig_bound + quantization_bound)
         ),
         "flip_sign": args.flip_sign,
+        "whiten_per_micrograph": args.whiten_per_micrograph,
+        "micrograph_noise_psd_source": str(args.micrograph_noise_psd or "these particles"),
         "output_stack": str(stack_path),
         "manifest": str(manifest_path),
         "elapsed_seconds": time.monotonic() - started,
