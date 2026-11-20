@@ -3,6 +3,11 @@
 Method-of-moments ab initio modeling for cryo-EM from denoised particle images. `kam` denoises the particles, keeps the least crowded
 ones and fits a low-resolution map to their first three Fourier-Bessel moments (M1, M2, M3), for example to initialize a refinement.
 
+This repository accompanies the paper
+
+> Yunpeng Shi, Amit Singer, Yuguan Wang and Andy Zhang, *Ab-initio cryo-EM reconstruction from moments of denoised images*,
+> [arXiv:2611.25525](https://arxiv.org/abs/2611.25525), 2026.
+
 ## Installation
 
 ```bash
