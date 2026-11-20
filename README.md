@@ -47,7 +47,8 @@ MoM fit examples/moments/EMPIAR-10081.npz --outdir fit_10081 --symmetry C4
 | `EMPIAR-11005.npz` | C1 | 10,000 | 6.53 |
 | `EMPIAR-11618.npz` | C1 | 10,000 | 3.81 |
 
-The map is `fit_10081/M3/recon.mrc`. Each fit takes 3 to 7 minutes on an H100 GPU.
+The map is `fit_10081/M3/recon.mrc`. Each fit takes 3 to 7 minutes on an H100 GPU. The maps of the paper are in `examples/volumes/`
+(64 x 64 x 64, with the pixel sizes of the table); as for any ab initio map, their orientation and handedness are arbitrary.
 
 ## Usage
 
