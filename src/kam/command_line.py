@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""The ``kam`` command.
+"""The ``MoM`` command.
 
-    kam pipeline particles.star --outdir results ...    denoise, select and reconstruct from a RELION particle STAR file
-    kam reconstruct denoised.mrcs --outdir out ...      reconstruct from a stack of denoised images
+    MoM pipeline particles.star --outdir results ...    denoise, select and reconstruct from a RELION particle STAR file
+    MoM reconstruct denoised.mrcs --outdir out ...      reconstruct from a stack of denoised images
+    MoM fit moments.npz --outdir out ...                reconstruct from precomputed moments (examples/moments)
 
 A pipeline run writes to ``<results>/<EMPIAR number>_<Slurm job id>/kam_pipeline`` (a local identifier outside Slurm), with its settings in
-``hyperparameters.json`` and its log in ``run.log``; a resumed run reuses the stages that finished with the same settings. ``kam denoise``
-and ``kam select`` are the stages the pipeline runs as separate processes.
+``hyperparameters.json`` and its log in ``run.log``; a resumed run reuses the stages that finished with the same settings. ``MoM denoise``
+and ``MoM select`` are the stages the pipeline runs as separate processes.
 """
 
 from __future__ import annotations
@@ -29,7 +30,8 @@ import numpy as np
 
 from .particles import (DEFAULT_DENOISE_MAX_ORDER, DEFAULT_DENOISE_RES, DEFAULT_N_SELECT, DEFAULT_NEIGHBOR_FRACTION,
                         SELECTION_OUTPUT_NAMES, FastCWFDenoiseConfig, denoise_relion_particles, select_particles)
-from .moments import DEFAULT_MOMENT_RES, MomentPreparationConfig, prepare_moments, prepare_moments_from_images
+from .moments import (DEFAULT_MOMENT_RES, MomentPreparationConfig, prepare_moments, prepare_moments_from_file,
+                      prepare_moments_from_images)
 from .optimization import (DEFAULT_ELL_MAX, DEFAULT_VIEWING_DEGREE, M3_MAXITER, MAXITER, N_INIT, ReconstructionConfig,
                            reconstruct_order, select_m2_start)
 from .shift import DEFAULT_SHIFT_STEP_PX
@@ -576,7 +578,7 @@ def _write_timing_report(
 
 def _pipeline_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="kam pipeline", allow_abbrev=False, formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        prog="MoM pipeline", allow_abbrev=False, formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         description=("Denoise the particles, select the least crowded ones and reconstruct the map from their M1, M2 and M3 "
                      "Fourier-Bessel moments. A run writes to <results>/<EMPIAR-number>_<SLURM-job-id>/kam_pipeline (a local "
                      "identifier outside Slurm); resolved settings go to hyperparameters.json and live progress to run.log."))
@@ -819,16 +821,9 @@ def select_main(argv=None):
     select_particles(**vars(_selection_parser().parse_args(argv)))
 
 
-def _reconstruct_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog="kam reconstruct", allow_abbrev=False, formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-        description=("MoM ab initio map from a stack of denoised particle images: the moment and M1 -> M2 -> M3 stages of "
-                     "kam pipeline without denoising and selection. The map is OUTDIR/M3/recon.mrc."))
-    parser.add_argument("stack", type=Path, help="MRC stack of square denoised images; the pixel size is read from its header")
+def _add_fit_options(parser: argparse.ArgumentParser) -> None:
+    """Options of the moment matching shared by ``MoM reconstruct`` and ``MoM fit``."""
     parser.add_argument("--outdir", type=Path, required=True, help="new output directory")
-    parser.add_argument("--moment-res", type=int, help="side of the moment images (default: the side of the stack)")
-    parser.add_argument("--vol-degree", dest="ell_max", metavar="VOL_DEGREE", type=int, default=DEFAULT_ELL_MAX,
-                        help="maximum SphFB angular degree of the volume")
     parser.add_argument("--viewing-degree", type=int, choices=(0, 2, 4), default=DEFAULT_VIEWING_DEGREE,
                         help="degree of the positive spherical-harmonic viewing density")
     parser.add_argument("--symmetry", default="C1", help="point group of the molecule (C1, Cn, Dn, T, O or I)")
@@ -838,7 +833,35 @@ def _reconstruct_parser() -> argparse.ArgumentParser:
                         help="largest ring radius in moment-grid pixels (default: side / 8)")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", choices=("cpu", "gpu"), default="gpu")
+
+
+def _fit_moments(root: Path, args: argparse.Namespace, side: int) -> None:
+    """M1 -> M2 -> M2 selection -> M3 on the moments in ``root/prepared`` (``side``-pixel moment images); the map is ``root/M3/recon.mrc``."""
+    for order in (1, 2, 3):
+        if order == 3:
+            select_m2_start(root / "prepared", root / "M2", root / "M2_selected", ell_max=args.ell_max,
+                            viewing_degree=args.viewing_degree, symmetry=args.symmetry, device=args.device)
+        print(f"[MoM] M{order}", flush=True)
+        reconstruct_order(ReconstructionConfig(
+            prepared_dir=root / "prepared", output_dir=root / f"M{order}", order=order,
+            ell_max=args.ell_max, viewing_degree=args.viewing_degree, symmetry=args.symmetry,
+            n_init=1 if order == 3 else N_INIT, maxiter=_maxiter(order), device=args.device, seed=args.seed,
+            initial_fit={1: None, 2: root / "M1", 3: root / "M2_selected"}[order],
+        ), _shift_settings(args, side))
+    print(f"[MoM] map: {root / 'M3' / 'recon.mrc'}", flush=True)
+
+
+def _reconstruct_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="MoM reconstruct", allow_abbrev=False, formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        description=("MoM ab initio map from a stack of denoised particle images: the moment and M1 -> M2 -> M3 stages of "
+                     "MoM pipeline without denoising and selection. The map is OUTDIR/M3/recon.mrc."))
+    parser.add_argument("stack", type=Path, help="MRC stack of square denoised images; the pixel size is read from its header")
+    parser.add_argument("--moment-res", type=int, help="side of the moment images (default: the side of the stack)")
+    parser.add_argument("--vol-degree", dest="ell_max", metavar="VOL_DEGREE", type=int, default=DEFAULT_ELL_MAX,
+                        help="maximum SphFB angular degree of the volume")
     parser.add_argument("--batch-size", type=int, default=256)
+    _add_fit_options(parser)
     return parser
 
 
@@ -850,28 +873,41 @@ def reconstruct_main(argv=None):
     args.moment_res = images.shape[-1] if args.moment_res is None else args.moment_res
     root = args.outdir.resolve()
     use_device(args.device)
-    print(f"[reconstruct] {len(images)} images of {images.shape[-1]} px at {pixel:.4g} A -> moments on {args.moment_res} px", flush=True)
+    print(f"[MoM] {len(images)} images of {images.shape[-1]} px at {pixel:.4g} A -> moments on {args.moment_res} px", flush=True)
     prepare_moments_from_images(
         images, pixel, root / "prepared", moment_res=args.moment_res, ell_max=args.ell_max, batch_size=args.batch_size,
         dataset=args.stack.stem, source=args.stack.resolve())
     del images
-    for order in (1, 2, 3):
-        if order == 3:
-            select_m2_start(root / "prepared", root / "M2", root / "M2_selected", ell_max=args.ell_max,
-                            viewing_degree=args.viewing_degree, symmetry=args.symmetry, device=args.device)
-        print(f"[reconstruct] M{order}", flush=True)
-        reconstruct_order(ReconstructionConfig(
-            prepared_dir=root / "prepared", output_dir=root / f"M{order}", order=order,
-            ell_max=args.ell_max, viewing_degree=args.viewing_degree, symmetry=args.symmetry,
-            n_init=1 if order == 3 else N_INIT, maxiter=_maxiter(order), device=args.device, seed=args.seed,
-            initial_fit={1: None, 2: root / "M1", 3: root / "M2_selected"}[order],
-        ), _shift_settings(args, args.moment_res))
-    print(f"[reconstruct] map: {root / 'M3' / 'recon.mrc'}", flush=True)
+    _fit_moments(root, args, args.moment_res)
     return 0
+
+
+def _fit_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="MoM fit", allow_abbrev=False, formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        description=("MoM ab initio map from precomputed moments (e.g. examples/moments): the M1 -> M2 -> M3 stages of MoM "
+                     "reconstruct. The volume degree is that of the moments. The map is OUTDIR/M3/recon.mrc."))
+    parser.add_argument("moments", type=Path, help="moments.npz of an earlier run (OUTDIR/prepared/moments.npz)")
+    _add_fit_options(parser)
+    return parser
+
+
+def fit_main(argv=None):
+    args = _fit_parser().parse_args(argv)
+    root = args.outdir.resolve()
+    use_device(args.device)
+    prepare_moments_from_file(args.moments, root / "prepared")
+    with np.load(root / "prepared" / "moments.npz", allow_pickle=False) as saved:
+        args.ell_max, side, n_images = int(saved["fb_ell_max"]), int(saved["ds_res"]), int(saved["n_images"])
+    print(f"[MoM] moments of {n_images} images on {side} px, volume degree {args.ell_max}: {args.moments}", flush=True)
+    _fit_moments(root, args, side)
+    return 0
+
 
 COMMANDS = {
     "pipeline": pipeline_main,
     "reconstruct": reconstruct_main,
+    "fit": fit_main,
     "denoise": denoise_main,
     "select": select_main,
 }

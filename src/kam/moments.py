@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
+import shutil
 import time
 
 import mrcfile
@@ -473,6 +474,23 @@ def prepare_moments_from_images(images, pixel_size, output, *, moment_res, ell_m
         n_m2_entries=int(m2.size), n_canonical_m3_entries=len(m3), metadata=metadata,
         prepared_file=str(moments_path), prepared_sha256=sha256_file(moments_path), kam_cryoem_commit=git_commit(ROOT),
         elapsed_seconds=time.monotonic() - started))
+    return output
+
+
+def prepare_moments_from_file(moments_file, output):
+    """Write ``moments.npz`` and ``report.json`` (the files of :func:`prepare_moments`) for precomputed moments, e.g. those in
+    ``examples/moments``."""
+
+    output = Path(output).resolve()
+    output.mkdir(parents=True, exist_ok=False)
+    moments_path = output / "moments.npz"
+    shutil.copyfile(moments_file, moments_path)
+    with np.load(moments_path, allow_pickle=False) as saved:
+        dataset, n_images, side = str(saved["dataset"]), int(saved["n_images"]), int(saved["ds_res"])
+    write_json(output / "report.json", dict(
+        created_utc=datetime.now(timezone.utc).isoformat(), dataset=dataset, moments_file=str(Path(moments_file).resolve()),
+        n_images=n_images, moment_res=side, prepared_file=str(moments_path), prepared_sha256=sha256_file(moments_path),
+        kam_cryoem_commit=git_commit(ROOT)))
     return output
 
 
