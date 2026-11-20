@@ -27,7 +27,7 @@ of 10.4 Å:
 MoM reconstruct examples/EMPIAR-10081_denoised_32px.mrcs --outdir example_out --symmetry C4
 ```
 
-The map is `example_out/M3/recon.mrc`. This takes about 3 minutes on an A100 GPU, 16 minutes on 16 CPU cores (`--device cpu`).
+The map is `example_out/M3/recon.mrc`.
 
 ## Moments of the paper
 
@@ -47,8 +47,8 @@ MoM fit examples/moments/EMPIAR-10081.npz --outdir fit_10081 --symmetry C4
 | `EMPIAR-11005.npz` | C1 | 10,000 | 6.53 |
 | `EMPIAR-11618.npz` | C1 | 10,000 | 3.81 |
 
-The map is `fit_10081/M3/recon.mrc`. Each fit takes 3 to 7 minutes on an H100 GPU. The maps of the paper are in `examples/volumes/`
-(64 x 64 x 64, with the pixel sizes of the table); as for any ab initio map, their orientation and handedness are arbitrary.
+The map is `fit_10081/M3/recon.mrc`. The maps of the paper are in `examples/volumes/` (64 x 64 x 64, with the pixel sizes of
+the table); as for any ab initio map, their orientation and handedness are arbitrary.
 
 ## Usage
 
